@@ -18,6 +18,9 @@ import (
 // NewRawWriter returns a new table writer for the file. Closing the writer will
 // close the file.
 func NewRawWriter(writable objstorage.Writable, o WriterOptions) RawWriter {
+	if o.TableFormat == TableFormatPMT0 {
+		return newPMTRawWriter(writable, o)
+	}
 	if o.TableFormat <= TableFormatPebblev4 {
 		return newRowWriter(writable, o)
 	}

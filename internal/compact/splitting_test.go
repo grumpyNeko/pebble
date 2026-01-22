@@ -133,3 +133,43 @@ func initTestFrontier(f *Frontiers, keys ...[]byte) *frontier {
 	ff.Init(f, key, reached)
 	return ff
 }
+
+func TestOutputSplitter_0(t *testing.T) {
+	var s *OutputSplitter
+	var grandparents manifest.LevelMetadata
+
+	var startKey, limitKey string
+	var targetFileSize uint64
+	f := &Frontiers{cmp: base.DefaultComparer.Compare}
+
+	startKey = "a"
+	limitKey = "f"
+	targetFileSize = 100
+	s = NewOutputSplitter(
+		base.DefaultComparer.Compare, []byte(startKey), []byte(limitKey),
+		targetFileSize, grandparents.Iter(), f,
+	)
+	var last string
+	Input := `a 1
+b 2
+c 3
+d 4
+e 5
+ez 6
+f 7`
+	for i, l := range strings.Split(Input, "\n") {
+		var key string
+		var estimatedSize uint64
+		fmt.Sscanf(l, "%s %d", &key, &estimatedSize)
+		// Advance the frontier, except (sometimes) for the first key where the
+		// splitter allows for the frontier to already be at the next user key.
+		if i > 0 || rand.IntN(2) == 0 {
+			f.Advance([]byte(key))
+		}
+		if s.ShouldSplitBefore([]byte(key), estimatedSize, func(k []byte) bool { return f.cmp(k, []byte(last)) == 0 }) {
+			println(fmt.Sprintf("%s %d: split at %q", key, estimatedSize, s.SplitKey()))
+		}
+		last = key
+	}
+	println(fmt.Sprintf("split at %q", s.SplitKey()))
+}

@@ -7,6 +7,7 @@ package pebble
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math/rand/v2"
 	"strconv"
@@ -378,6 +379,53 @@ func TestMemTableReserved(t *testing.T) {
 	prevReserved := m.reserved
 	m.prepare(b)
 	require.Equal(t, int(m.reserved), int(b.memTableSize)+int(prevReserved))
+}
+
+// 写入1M个uint64KV, skiplist需要多少内存
+func TestMemTableSkiplistMillionUint64(t *testing.T) {
+	const (
+		keyCount         = 1_000_000
+		keyBytes         = 8
+		valueBytes       = 8
+		slackNumerator   = 11
+		slackDenominator = 10
+	)
+	entryBytes := memTableEntrySize(keyBytes, valueBytes)
+	totalBytes := entryBytes * uint64(keyCount)
+	memSize := int(totalBytes*slackNumerator/slackDenominator) + int(memTableEmptySize)
+	if memSize < 1<<20 {
+		memSize = 1 << 20
+	}
+	m := newMemTable(memTableOptions{size: memSize})
+	var key [8]byte
+	var val [8]byte
+	for i := 0; i < keyCount; i++ {
+		v := uint64(i)
+		binary.BigEndian.PutUint64(key[:], v)
+		binary.BigEndian.PutUint64(val[:], v)
+		seqNum := base.SeqNum(v + 1)
+		ikey := base.MakeInternalKey(key[:], seqNum, InternalKeyKindSet)
+		require.NoErrorf(t, m.set(ikey, val[:]), "insert %d", i)
+	}
+	inuseBytes := m.inuseBytes()
+	require.NotZero(t, inuseBytes)
+	require.LessOrEqual(t, inuseBytes, uint64(memSize))
+	t.Logf("memtable in-use bytes: %d (%.2f bytes/key)", inuseBytes, float64(inuseBytes)/float64(keyCount))
+
+	//rng := rand.New(rand.NewPCG(0, 0))
+	//const probes = 10_000
+	//var lookupKey [8]byte
+	//for i := 0; i < probes; i++ {
+	//	want := uint64(rng.IntN(keyCount))
+	//	binary.BigEndian.PutUint64(lookupKey[:], want)
+	//	got, err := m.get(lookupKey[:])
+	//	require.NoError(t, err)
+	//	require.Equal(t, want, binary.BigEndian.Uint64(got))
+	//}
+	//var missKey [8]byte
+	//binary.BigEndian.PutUint64(missKey[:], uint64(keyCount)+123)
+	//_, err := m.get(missKey[:])
+	//require.ErrorIs(t, err, ErrNotFound)
 }
 
 func TestMemTable(t *testing.T) {

@@ -563,6 +563,20 @@ func (pc *pickedCompaction) setupMultiLevelCandidate(opts *Options, diskAvailByt
 	return pc.setupInputs(opts, diskAvailBytes, pc.extraLevels[len(pc.extraLevels)-1])
 }
 
+// 改成函数式的
+func setupMultiLevelCandidate0(pc *pickedCompaction, opts *Options, diskAvailBytes uint64) *pickedCompaction {
+	ret := pc.clone()
+	ret.inputs = append(ret.inputs, compactionLevel{level: ret.outputLevel.level + 1})
+	ret.startLevel = &ret.inputs[0]
+	ret.extraLevels = []*compactionLevel{&ret.inputs[1]}
+	ret.outputLevel = &ret.inputs[2]
+	ok := ret.setupInputs(opts, diskAvailBytes, ret.extraLevels[len(ret.extraLevels)-1])
+	if !ok {
+		return pc
+	}
+	return ret
+}
+
 // anyTablesCompacting returns true if any tables in the level slice are
 // compacting.
 func anyTablesCompacting(inputs manifest.LevelSlice) bool {
@@ -1772,6 +1786,7 @@ func pickL0(env compactionEnv, opts *Options, vers *version, baseLevel int) (pc 
 		return
 	}
 	if lcf != nil {
+		//panic("i don't want IntraL0Compaction")
 		pc = newPickedCompactionFromL0(lcf, opts, vers, 0, false)
 		if !pc.setupInputs(opts, env.diskAvailBytes, pc.startLevel) {
 			return nil

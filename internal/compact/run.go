@@ -5,7 +5,9 @@
 package compact
 
 import (
-	"sort"
+	"encoding/binary"
+	"github.com/cockroachdb/pebble/internal/pmtinternal"
+	"math"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -269,46 +271,67 @@ func (r *Runner) Finish() Result {
 // startKey (which must be strictly greater than startKey), or nil if there is
 // no limit.
 func (r *Runner) TableSplitLimit(startKey []byte) []byte {
-	var limitKey []byte
+	if startKey == nil {
+		panic("why?")
+	}
 
-	// Enforce the MaxGrandparentOverlapBytes limit: find the user key to which
-	// that table can extend without excessively overlapping the grandparent
-	// level. If no limit is needed considering the grandparent, limitKey stays
-	// nil.
+	splitKeys := []uint64{}
+	for _, e := range pmtinternal.PartIdx {
+		// Split point is after the partition's high bound
+		if e.High != math.MaxUint64 {
+			splitKeys = append(splitKeys, e.High+1)
+		}
+	}
+
+	for _, splitKey := range splitKeys {
+		sk := make([]byte, 8)
+		binary.BigEndian.PutUint64(sk, splitKey)
+		if r.cmp(startKey, sk) < 0 {
+			return sk
+		}
+	}
+	return nil
+
+	//var limitKey []byte
 	//
-	// This is done in order to prevent a table at level N from overlapping too
-	// much data at level N+1. We want to avoid such large overlaps because they
-	// translate into large compactions. The current heuristic stops output of a
-	// table if the addition of another key would cause the table to overlap more
-	// than 10x the target file size at level N. See
-	// compaction.maxGrandparentOverlapBytes.
-	iter := r.cfg.Grandparents.Iter()
-	var overlappedBytes uint64
-	f := iter.SeekGE(r.cmp, startKey)
-	// Handle an overlapping table.
-	if f != nil && r.cmp(f.Smallest.UserKey, startKey) <= 0 {
-		overlappedBytes += f.Size
-		f = iter.Next()
-	}
-	for ; f != nil; f = iter.Next() {
-		overlappedBytes += f.Size
-		if overlappedBytes > r.cfg.MaxGrandparentOverlapBytes {
-			limitKey = f.Smallest.UserKey
-			break
-		}
-	}
-
-	if len(r.cfg.L0SplitKeys) != 0 {
-		// Find the first split key that is greater than startKey.
-		index := sort.Search(len(r.cfg.L0SplitKeys), func(i int) bool {
-			return r.cmp(r.cfg.L0SplitKeys[i], startKey) > 0
-		})
-		if index < len(r.cfg.L0SplitKeys) {
-			limitKey = base.MinUserKey(r.cmp, limitKey, r.cfg.L0SplitKeys[index])
-		}
-	}
-
-	return limitKey
+	//// Enforce the MaxGrandparentOverlapBytes limit: find the user key to which
+	//// that table can extend without excessively overlapping the grandparent
+	//// level. If no limit is needed considering the grandparent, limitKey stays
+	//// nil.
+	////
+	//// This is done in order to prevent a table at level N from overlapping too
+	//// much data at level N+1. We want to avoid such large overlaps because they
+	//// translate into large compactions. The current heuristic stops output of a
+	//// table if the addition of another key would cause the table to overlap more
+	//// than 10x the target file size at level N. See
+	//// compaction.maxGrandparentOverlapBytes.
+	//iter := r.cfg.Grandparents.Iter()
+	//var overlappedBytes uint64
+	//f := iter.SeekGE(r.cmp, startKey)
+	//// Handle an overlapping table.
+	//if f != nil && r.cmp(f.Smallest.UserKey, startKey) <= 0 {
+	//	overlappedBytes += f.Size
+	//	f = iter.Next()
+	//}
+	//for ; f != nil; f = iter.Next() {
+	//	overlappedBytes += f.Size
+	//	if overlappedBytes > r.cfg.MaxGrandparentOverlapBytes {
+	//		limitKey = f.Smallest.UserKey
+	//		break
+	//	}
+	//}
+	//
+	//if len(r.cfg.L0SplitKeys) != 0 {
+	//	// Find the first split key that is greater than startKey.
+	//	index := sort.Search(len(r.cfg.L0SplitKeys), func(i int) bool {
+	//		return r.cmp(r.cfg.L0SplitKeys[i], startKey) > 0
+	//	})
+	//	if index < len(r.cfg.L0SplitKeys) {
+	//		limitKey = base.MinUserKey(r.cmp, limitKey, r.cfg.L0SplitKeys[index])
+	//	}
+	//}
+	//
+	//return limitKey
 }
 
 // validateWriterMeta runs some sanity cehcks on the WriterMetadata on an output

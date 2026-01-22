@@ -7,6 +7,8 @@ package pebble
 import (
 	"context"
 	"fmt"
+	"github.com/cockroachdb/pebble/pmtstate"
+	"github.com/cockroachdb/pebble/vfs"
 	"slices"
 	"sort"
 	"time"
@@ -527,6 +529,9 @@ func ingestLoad(
 	shouldDisableRangeKeyChecks := len(shared) > 0 || len(external) > 0 || opts.Experimental.CreateOnShared != remote.CreateOnSharedNone
 	for i := range paths {
 		f, err := opts.FS.Open(paths[i])
+		if pmtstate.IngestFS {
+			f, err = vfs.Default.Open(paths[i])
+		}
 		if err != nil {
 			return ingestLoadResult{}, err
 		}
@@ -699,6 +704,12 @@ func ingestLinkLocal(
 			ctx, opts.FS, localMetas[i].path, base.FileTypeTable, localMetas[i].FileBacking.DiskFileNum,
 			objstorage.CreateOptions{PreferSharedStorage: true},
 		)
+		if pmtstate.IngestFS {
+			objMeta, err = objProvider.LinkOrCopyFromLocal(
+				ctx, vfs.Default, localMetas[i].path, base.FileTypeTable, localMetas[i].FileBacking.DiskFileNum,
+				objstorage.CreateOptions{PreferSharedStorage: true},
+			)
+		}
 		if err != nil {
 			if err2 := ingestCleanup(objProvider, localMetas[:i]); err2 != nil {
 				opts.Logger.Errorf("ingest cleanup failed: %v", err2)
@@ -1775,6 +1786,360 @@ func (d *DB) ingest(
 	return stats, err
 }
 
+func (d *DB) ingest0(
+	ctx context.Context,
+	paths []string,
+	shared []SharedSSTMeta,
+	exciseSpan KeyRange,
+	external []ExternalFile,
+	level int,
+) (IngestOperationStats, error) {
+	if len(shared) > 0 && d.opts.Experimental.RemoteStorage == nil {
+		panic("cannot ingest shared sstables with nil SharedStorage")
+	}
+	if (exciseSpan.Valid() || len(shared) > 0 || len(external) > 0) && d.FormatMajorVersion() < FormatVirtualSSTables {
+		return IngestOperationStats{}, errors.New("pebble: format major version too old for excise, shared or external sstable ingestion")
+	}
+	if len(external) > 0 && d.FormatMajorVersion() < FormatSyntheticPrefixSuffix {
+		for i := range external {
+			if len(external[i].SyntheticPrefix) > 0 {
+				return IngestOperationStats{}, errors.New("pebble: format major version too old for synthetic prefix ingestion")
+			}
+			if len(external[i].SyntheticSuffix) > 0 {
+				return IngestOperationStats{}, errors.New("pebble: format major version too old for synthetic suffix ingestion")
+			}
+		}
+	}
+	// Allocate file numbers for all of the files being ingested and mark them as
+	// pending in order to prevent them from being deleted. Note that this causes
+	// the file number ordering to be out of alignment with sequence number
+	// ordering. The sorting of L0 tables by sequence number avoids relying on
+	// that (busted) invariant.
+	pendingOutputs := make([]base.FileNum, len(paths)+len(shared)+len(external))
+	for i := 0; i < len(paths)+len(shared)+len(external); i++ {
+		pendingOutputs[i] = d.mu.versions.getNextFileNum()
+	}
+
+	jobID := d.newJobID()
+
+	// Load the metadata for all the files being ingested. This step detects
+	// and elides empty sstables.
+	loadResult, err := ingestLoad(ctx, d.opts, d.FormatMajorVersion(), paths, shared, external, d.cacheHandle, pendingOutputs)
+	if err != nil {
+		return IngestOperationStats{}, err
+	}
+
+	if loadResult.fileCount() == 0 && !exciseSpan.Valid() {
+		// All of the sstables to be ingested were empty. Nothing to do.
+		return IngestOperationStats{}, nil
+	}
+
+	// Verify the sstables do not overlap.
+	if err := ingestSortAndVerify(d.cmp, loadResult, exciseSpan); err != nil {
+		return IngestOperationStats{}, err
+	}
+
+	// Hard link the sstables into the DB directory. Since the sstables aren't
+	// referenced by a version, they won't be used. If the hard linking fails
+	// (e.g. because the files reside on a different filesystem), ingestLinkLocal
+	// will fall back to copying, and if that fails we undo our work and return an
+	// error.
+	if err := ingestLinkLocal(ctx, jobID, d.opts, d.objProvider, loadResult.local); err != nil {
+		return IngestOperationStats{}, err
+	}
+
+	err = d.ingestAttachRemote(jobID, loadResult)
+	defer d.ingestUnprotectExternalBackings(loadResult)
+	if err != nil {
+		return IngestOperationStats{}, err
+	}
+
+	// Make the new tables durable. We need to do this at some point before we
+	// update the MANIFEST (via logAndApply), otherwise a crash can have the
+	// tables referenced in the MANIFEST, but not present in the provider.
+	if err := d.objProvider.Sync(); err != nil {
+		return IngestOperationStats{}, err
+	}
+
+	// metaFlushableOverlaps is a map indicating which of the ingested sstables
+	// overlap some table in the flushable queue. It's used to approximate
+	// ingest-into-L0 stats when using flushable ingests.
+	metaFlushableOverlaps := make(map[base.FileNum]bool, loadResult.fileCount())
+	var mem *flushableEntry
+	var mut *memTable
+	// asFlushable indicates whether the sstable was ingested as a flushable.
+	var asFlushable bool
+	prepare := func(seqNum base.SeqNum) {
+		// Note that d.commit.mu is held by commitPipeline when calling prepare.
+
+		// Determine the set of bounds we care about for the purpose of checking
+		// for overlap among the flushables. If there's an excise span, we need
+		// to check for overlap with its bounds as well.
+		overlapBounds := make([]bounded, 0, loadResult.fileCount()+1)
+		for _, m := range loadResult.local {
+			overlapBounds = append(overlapBounds, m.tableMetadata)
+		}
+		for _, m := range loadResult.shared {
+			overlapBounds = append(overlapBounds, m.tableMetadata)
+		}
+		for _, m := range loadResult.external {
+			overlapBounds = append(overlapBounds, m.tableMetadata)
+		}
+		if exciseSpan.Valid() {
+			overlapBounds = append(overlapBounds, &exciseSpan)
+		}
+
+		d.mu.Lock()
+		defer d.mu.Unlock()
+
+		if exciseSpan.Valid() {
+			// Check if any of the currently-open EventuallyFileOnlySnapshots
+			// overlap in key ranges with the excise span. If so, we need to
+			// check for memtable overlaps with all bounds of that
+			// EventuallyFileOnlySnapshot in addition to the ingestion's own
+			// bounds too.
+			overlapBounds = append(overlapBounds, exciseOverlapBounds(
+				d.cmp, &d.mu.snapshots.snapshotList, exciseSpan, seqNum)...)
+		}
+
+		// Check to see if any files overlap with any of the memtables. The queue
+		// is ordered from oldest to newest with the mutable memtable being the
+		// last element in the slice. We want to wait for the newest table that
+		// overlaps.
+
+		for i := len(d.mu.mem.queue) - 1; i >= 0; i-- {
+			m := d.mu.mem.queue[i]
+			m.computePossibleOverlaps(func(b bounded) shouldContinue {
+				// If this is the first table to overlap a flushable, save
+				// the flushable. This ingest must be ingested or flushed
+				// after it.
+				if mem == nil {
+					mem = m
+				}
+
+				switch v := b.(type) {
+				case *tableMetadata:
+					// NB: False positives are possible if `m` is a flushable
+					// ingest that overlaps the file `v` in bounds but doesn't
+					// contain overlapping data. This is considered acceptable
+					// because it's rare (in CockroachDB a bound overlap likely
+					// indicates a data overlap), and blocking the commit
+					// pipeline while we perform I/O to check for overlap may be
+					// more disruptive than enqueueing this ingestion on the
+					// flushable queue and switching to a new memtable.
+					metaFlushableOverlaps[v.FileNum] = true
+				case *KeyRange:
+					// An excise span or an EventuallyFileOnlySnapshot protected range;
+					// not a file.
+				default:
+					panic("unreachable")
+				}
+				return continueIteration
+			}, overlapBounds...)
+		}
+
+		if mem == nil {
+			// No overlap with any of the queued flushables, so no need to queue
+			// after them.
+
+			// New writes with higher sequence numbers may be concurrently
+			// committed. We must ensure they don't flush before this ingest
+			// completes. To do that, we ref the mutable memtable as a writer,
+			// preventing its flushing (and the flushing of all subsequent
+			// flushables in the queue). Once we've acquired the manifest lock
+			// to add the ingested sstables to the LSM, we can unref as we're
+			// guaranteed that the flush won't edit the LSM before this ingest.
+			mut = d.mu.mem.mutable
+			mut.writerRef()
+			return
+		}
+
+		// The ingestion overlaps with some entry in the flushable queue. If the
+		// pre-conditions are met below, we can treat this ingestion as a flushable
+		// ingest, otherwise we wait on the memtable flush before ingestion.
+		//
+		// TODO(aaditya): We should make flushableIngest compatible with remote
+		// files.
+		hasRemoteFiles := len(shared) > 0 || len(external) > 0
+		canIngestFlushable := d.FormatMajorVersion() >= FormatFlushableIngest &&
+			(len(d.mu.mem.queue) < d.opts.MemTableStopWritesThreshold) &&
+			!d.opts.Experimental.DisableIngestAsFlushable() && !hasRemoteFiles &&
+			(!exciseSpan.Valid() || d.FormatMajorVersion() >= FormatFlushableIngestExcises)
+
+		if !canIngestFlushable {
+			// We're not able to ingest as a flushable,
+			// so we must synchronously flush.
+			//
+			// TODO(bilal): Currently, if any of the files being ingested are shared,
+			// we cannot use flushable ingests and need
+			// to wait synchronously.
+			if mem.flushable == d.mu.mem.mutable {
+				err = d.makeRoomForWrite(nil)
+			}
+			// New writes with higher sequence numbers may be concurrently
+			// committed. We must ensure they don't flush before this ingest
+			// completes. To do that, we ref the mutable memtable as a writer,
+			// preventing its flushing (and the flushing of all subsequent
+			// flushables in the queue). Once we've acquired the manifest lock
+			// to add the ingested sstables to the LSM, we can unref as we're
+			// guaranteed that the flush won't edit the LSM before this ingest.
+			mut = d.mu.mem.mutable
+			mut.writerRef()
+			mem.flushForced = true
+			d.maybeScheduleFlush()
+			return
+		}
+		// Since there aren't too many memtables already queued up, we can
+		// slide the ingested sstables on top of the existing memtables.
+		asFlushable = true
+		fileMetas := make([]*tableMetadata, len(loadResult.local))
+		for i := range fileMetas {
+			fileMetas[i] = loadResult.local[i].tableMetadata
+		}
+		err = d.handleIngestAsFlushable(fileMetas, seqNum, exciseSpan)
+	}
+
+	var ve *versionEdit
+	apply := func(seqNum base.SeqNum) {
+		if err != nil || asFlushable {
+			// An error occurred during prepare.
+			if mut != nil {
+				if mut.writerUnref() {
+					d.mu.Lock()
+					d.maybeScheduleFlush()
+					d.mu.Unlock()
+				}
+			}
+			return
+		}
+
+		// If there's an excise being done atomically with the same ingest, we
+		// assign the lowest sequence number in the set of sequence numbers for this
+		// ingestion to the excise. Note that we've already allocated fileCount+1
+		// sequence numbers in this case.
+		if exciseSpan.Valid() {
+			seqNum++ // the first seqNum is reserved for the excise.
+		}
+		// Update the sequence numbers for all ingested sstables'
+		// metadata. When the version edit is applied, the metadata is
+		// written to the manifest, persisting the sequence number.
+		// The sstables themselves are left unmodified.
+		if err = ingestUpdateSeqNum(
+			d.cmp, d.opts.Comparer.FormatKey, seqNum, loadResult,
+		); err != nil {
+			if mut != nil {
+				if mut.writerUnref() {
+					d.mu.Lock()
+					d.maybeScheduleFlush()
+					d.mu.Unlock()
+				}
+			}
+			return
+		}
+
+		// If we overlapped with a memtable in prepare wait for the flush to
+		// finish.
+		if mem != nil {
+			<-mem.flushed
+		}
+
+		// Assign the sstables to the correct level in the LSM and apply the
+		// version edit.
+		ve, err = d.ingestApply0(ctx, jobID, loadResult, mut, exciseSpan, seqNum, level)
+	}
+
+	// Only one ingest can occur at a time because if not, one would block waiting
+	// for the other to finish applying. This blocking would happen while holding
+	// the commit mutex which would prevent unrelated batches from writing their
+	// changes to the WAL and memtable. This will cause a bigger commit hiccup
+	// during ingestion.
+	seqNumCount := loadResult.fileCount()
+	if exciseSpan.Valid() {
+		seqNumCount++
+	}
+	d.commit.ingestSem <- struct{}{}
+	d.commit.AllocateSeqNum(seqNumCount, prepare, apply)
+	<-d.commit.ingestSem
+
+	if err != nil {
+		if err2 := ingestCleanup(d.objProvider, loadResult.local); err2 != nil {
+			d.opts.Logger.Errorf("ingest cleanup failed: %v", err2)
+		}
+	} else {
+		// Since we either created a hard link to the ingesting files, or copied
+		// them over, it is safe to remove the originals paths.
+		for i := range loadResult.local {
+			path := loadResult.local[i].path
+			if err2 := d.opts.FS.Remove(path); err2 != nil {
+				d.opts.Logger.Errorf("ingest failed to remove original file: %s", err2)
+			}
+		}
+	}
+
+	// TODO(jackson): Refactor this so that the case where there are no files
+	// but a valid excise span is not so exceptional.
+
+	var stats IngestOperationStats
+	if loadResult.fileCount() > 0 {
+		info := TableIngestInfo{
+			JobID:     int(jobID),
+			Err:       err,
+			flushable: asFlushable,
+		}
+		if len(loadResult.local) > 0 {
+			info.GlobalSeqNum = loadResult.local[0].SmallestSeqNum
+		} else if len(loadResult.shared) > 0 {
+			info.GlobalSeqNum = loadResult.shared[0].SmallestSeqNum
+		} else {
+			info.GlobalSeqNum = loadResult.external[0].SmallestSeqNum
+		}
+		if ve != nil {
+			info.Tables = make([]struct {
+				TableInfo
+				Level int
+			}, len(ve.NewTables))
+			for i := range ve.NewTables {
+				e := &ve.NewTables[i]
+				info.Tables[i].Level = e.Level
+				info.Tables[i].TableInfo = e.Meta.TableInfo()
+				stats.Bytes += e.Meta.Size
+				if e.Level == 0 {
+					stats.ApproxIngestedIntoL0Bytes += e.Meta.Size
+				}
+				if metaFlushableOverlaps[e.Meta.FileNum] {
+					stats.MemtableOverlappingFiles++
+				}
+			}
+		} else if asFlushable {
+			// NB: If asFlushable == true, there are no shared sstables.
+			info.Tables = make([]struct {
+				TableInfo
+				Level int
+			}, len(loadResult.local))
+			for i, f := range loadResult.local {
+				info.Tables[i].Level = -1
+				info.Tables[i].TableInfo = f.TableInfo()
+				stats.Bytes += f.Size
+				// We don't have exact stats on which files will be ingested into
+				// L0, because actual ingestion into the LSM has been deferred until
+				// flush time. Instead, we infer based on memtable overlap.
+				//
+				// TODO(jackson): If we optimistically compute data overlap (#2112)
+				// before entering the commit pipeline, we can use that overlap to
+				// improve our approximation by incorporating overlap with L0, not
+				// just memtables.
+				if metaFlushableOverlaps[f.FileNum] {
+					stats.ApproxIngestedIntoL0Bytes += f.Size
+					stats.MemtableOverlappingFiles++
+				}
+			}
+		}
+		d.opts.EventListener.TableIngested(info)
+	}
+
+	return stats, err
+}
+
 type ingestSplitFile struct {
 	// ingestFile is the file being ingested.
 	ingestFile *tableMetadata
@@ -2017,6 +2382,327 @@ func (d *DB) ingestApply(
 					f.Level, splitTable, err = ingestTargetLevel(
 						ctx, d.cmp, lsmOverlap, baseLevel, d.mu.compact.inProgress, m, shouldIngestSplit,
 					)
+				}
+			}
+
+			if splitTable != nil {
+				if invariants.Enabled {
+					if lf := current.Levels[f.Level].Find(d.cmp, splitTable); lf.Empty() {
+						panic("splitFile returned is not in level it should be")
+					}
+				}
+				// We take advantage of the fact that we won't drop the db mutex
+				// between now and the call to logAndApply. So, no files should
+				// get added to a new in-progress compaction at this point. We can
+				// avoid having to iterate on in-progress compactions to cancel them
+				// if none of the files being split have a compacting state.
+				if splitTable.IsCompacting() {
+					checkCompactions = true
+				}
+				filesToSplit = append(filesToSplit, ingestSplitFile{ingestFile: m, splitFile: splitTable, level: f.Level})
+			}
+		}
+		if err != nil {
+			// No need to invalidate the pickedCompactionCache since the latest
+			// version has not changed.
+			d.mu.versions.logUnlock()
+			return nil, err
+		}
+		if isShared && f.Level < sharedLevelsStart {
+			panic(fmt.Sprintf("cannot slot a shared file higher than the highest shared level: %d < %d",
+				f.Level, sharedLevelsStart))
+		}
+		f.Meta = m
+		levelMetrics := metrics[f.Level]
+		if levelMetrics == nil {
+			levelMetrics = &LevelMetrics{}
+			metrics[f.Level] = levelMetrics
+		}
+		levelMetrics.NumFiles++
+		levelMetrics.Size += int64(m.Size)
+		levelMetrics.BytesIngested += m.Size
+		levelMetrics.TablesIngested++
+	}
+	// replacedFiles maps files excised due to exciseSpan (or splitFiles returned
+	// by ingestTargetLevel), to files that were created to replace it. This map
+	// is used to resolve references to split files in filesToSplit, as it is
+	// possible for a file that we want to split to no longer exist or have a
+	// newer fileMetadata due to a split induced by another ingestion file, or an
+	// excise.
+	replacedFiles := make(map[base.FileNum][]newTableEntry)
+	updateLevelMetricsOnExcise := func(m *tableMetadata, level int, added []newTableEntry) {
+		levelMetrics := metrics[level]
+		if levelMetrics == nil {
+			levelMetrics = &LevelMetrics{}
+			metrics[level] = levelMetrics
+		}
+		levelMetrics.NumFiles--
+		levelMetrics.Size -= int64(m.Size)
+		for i := range added {
+			levelMetrics.NumFiles++
+			levelMetrics.Size += int64(added[i].Meta.Size)
+		}
+	}
+	if exciseSpan.Valid() {
+		// Iterate through all levels and find files that intersect with exciseSpan.
+		//
+		// TODO(bilal): We could drop the DB mutex here as we don't need it for
+		// excises; we only need to hold the version lock which we already are
+		// holding. However releasing the DB mutex could mess with the
+		// ingestTargetLevel calculation that happened above, as it assumed that it
+		// had a complete view of in-progress compactions that wouldn't change
+		// until logAndApply is called. If we were to drop the mutex now, we could
+		// schedule another in-progress compaction that would go into the chosen target
+		// level and lead to file overlap within level (which would panic in
+		// logAndApply). We should drop the db mutex here, do the excise, then
+		// re-grab the DB mutex and rerun just the in-progress compaction check to
+		// see if any new compactions are conflicting with our chosen target levels
+		// for files, and if they are, we should signal those compactions to error
+		// out.
+		for level := range current.Levels {
+			overlaps := current.Overlaps(level, exciseSpan.UserKeyBounds())
+			iter := overlaps.Iter()
+
+			for m := iter.First(); m != nil; m = iter.Next() {
+				newFiles, err := d.excise(ctx, exciseSpan.UserKeyBounds(), m, ve, level)
+				if err != nil {
+					return nil, err
+				}
+
+				if _, ok := ve.DeletedTables[deletedFileEntry{
+					Level:   level,
+					FileNum: m.FileNum,
+				}]; !ok {
+					// We did not excise this file.
+					continue
+				}
+				replacedFiles[m.FileNum] = newFiles
+				updateLevelMetricsOnExcise(m, level, newFiles)
+			}
+		}
+	}
+	if len(filesToSplit) > 0 {
+		// For the same reasons as the above call to excise, we hold the db mutex
+		// while calling this method.
+		if err := d.ingestSplit(ctx, ve, updateLevelMetricsOnExcise, filesToSplit, replacedFiles); err != nil {
+			return nil, err
+		}
+	}
+	if len(filesToSplit) > 0 || exciseSpan.Valid() {
+		for c := range d.mu.compact.inProgress {
+			if c.versionEditApplied {
+				continue
+			}
+			// Check if this compaction overlaps with the excise span. Note that just
+			// checking if the inputs individually overlap with the excise span
+			// isn't sufficient; for instance, a compaction could have [a,b] and [e,f]
+			// as inputs and write it all out as [a,b,e,f] in one sstable. If we're
+			// doing a [c,d) excise at the same time as this compaction, we will have
+			// to error out the whole compaction as we can't guarantee it hasn't/won't
+			// write a file overlapping with the excise span.
+			if exciseSpan.OverlapsInternalKeyRange(d.cmp, c.smallest, c.largest) {
+				c.cancel.Store(true)
+			}
+			// Check if this compaction's inputs have been replaced due to an
+			// ingest-time split. In that case, cancel the compaction as a newly picked
+			// compaction would need to include any new files that slid in between
+			// previously-existing files. Note that we cancel any compaction that has a
+			// file that was ingest-split as an input, even if it started before this
+			// ingestion.
+			if checkCompactions {
+				for i := range c.inputs {
+					iter := c.inputs[i].files.Iter()
+					for f := iter.First(); f != nil; f = iter.Next() {
+						if _, ok := replacedFiles[f.FileNum]; ok {
+							c.cancel.Store(true)
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if err := d.mu.versions.logAndApply(jobID, ve, metrics, false /* forceRotation */, func() []compactionInfo {
+		return d.getInProgressCompactionInfoLocked(nil)
+	}); err != nil {
+		// Note: any error during logAndApply is fatal; this won't be reachable in production.
+		return nil, err
+	}
+
+	// Check for any EventuallyFileOnlySnapshots that could be watching for
+	// an excise on this span. There should be none as the
+	// computePossibleOverlaps steps should have forced these EFOS to transition
+	// to file-only snapshots by now. If we see any that conflict with this
+	// excise, panic.
+	if exciseSpan.Valid() {
+		for s := d.mu.snapshots.root.next; s != &d.mu.snapshots.root; s = s.next {
+			// Skip non-EFOS snapshots, and also skip any EFOS that were created
+			// *after* the excise.
+			if s.efos == nil || base.Visible(exciseSeqNum, s.efos.seqNum, base.SeqNumMax) {
+				continue
+			}
+			efos := s.efos
+			// TODO(bilal): We can make this faster by taking advantage of the sorted
+			// nature of protectedRanges to do a sort.Search, or even maintaining a
+			// global list of all protected ranges instead of having to peer into every
+			// snapshot.
+			for i := range efos.protectedRanges {
+				if efos.protectedRanges[i].OverlapsKeyRange(d.cmp, exciseSpan) {
+					panic("unexpected excise of an EventuallyFileOnlySnapshot's bounds")
+				}
+			}
+		}
+	}
+
+	d.mu.versions.metrics.Ingest.Count++
+
+	d.updateReadStateLocked(d.opts.DebugCheck)
+	// updateReadStateLocked could have generated obsolete tables, schedule a
+	// cleanup job if necessary.
+	d.deleteObsoleteFiles(jobID)
+	d.updateTableStatsLocked(ve.NewTables)
+	// The ingestion may have pushed a level over the threshold for compaction,
+	// so check to see if one is necessary and schedule it.
+	d.maybeScheduleCompaction()
+	var toValidate []manifest.NewTableEntry
+	dedup := make(map[base.DiskFileNum]struct{})
+	for _, entry := range ve.NewTables {
+		if _, ok := dedup[entry.Meta.FileBacking.DiskFileNum]; !ok {
+			toValidate = append(toValidate, entry)
+			dedup[entry.Meta.FileBacking.DiskFileNum] = struct{}{}
+		}
+	}
+	d.maybeValidateSSTablesLocked(toValidate)
+	return ve, nil
+}
+
+func (d *DB) ingestApply0(
+	ctx context.Context,
+	jobID JobID,
+	lr ingestLoadResult,
+	mut *memTable,
+	exciseSpan KeyRange,
+	exciseSeqNum base.SeqNum,
+	level int,
+) (*versionEdit, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	ve := &versionEdit{
+		NewTables: make([]newTableEntry, lr.fileCount()),
+	}
+	if exciseSpan.Valid() || (d.opts.Experimental.IngestSplit != nil && d.opts.Experimental.IngestSplit()) {
+		ve.DeletedTables = map[manifest.DeletedTableEntry]*manifest.TableMetadata{}
+	}
+	metrics := make(map[int]*LevelMetrics)
+
+	// Lock the manifest for writing before we use the current version to
+	// determine the target level. This prevents two concurrent ingestion jobs
+	// from using the same version to determine the target level, and also
+	// provides serialization with concurrent compaction and flush jobs.
+	// logAndApply unconditionally releases the manifest lock, but any earlier
+	// returns must unlock the manifest.
+	d.mu.versions.logLock()
+
+	if mut != nil {
+		// Unref the mutable memtable to allows its flush to proceed. Now that we've
+		// acquired the manifest lock, we can be certain that if the mutable
+		// memtable has received more recent conflicting writes, the flush won't
+		// beat us to applying to the manifest resulting in sequence number
+		// inversion. Even though we call maybeScheduleFlush right now, this flush
+		// will apply after our ingestion.
+		if mut.writerUnref() {
+			d.maybeScheduleFlush()
+		}
+	}
+
+	current := d.mu.versions.currentVersion()
+	//overlapChecker := &overlapChecker{
+	//	comparer: d.opts.Comparer,
+	//	newIters: d.newIters,
+	//	opts: IterOptions{
+	//		logger:   d.opts.Logger,
+	//		Category: categoryIngest,
+	//	},
+	//	v: current,
+	//}
+	//shouldIngestSplit := d.opts.Experimental.IngestSplit != nil &&
+	//	d.opts.Experimental.IngestSplit() && d.FormatMajorVersion() >= FormatVirtualSSTables
+	baseLevel := d.mu.versions.picker.getBaseLevel()
+	// filesToSplit is a list where each element is a pair consisting of a file
+	// being ingested and a file being split to make room for an ingestion into
+	// that level. Each ingested file will appear at most once in this list. It
+	// is possible for split files to appear twice in this list.
+	filesToSplit := make([]ingestSplitFile, 0)
+	checkCompactions := false
+	for i := 0; i < lr.fileCount(); i++ {
+		// Determine the lowest level in the LSM for which the sstable doesn't
+		// overlap any existing files in the level.
+		var m *tableMetadata
+		specifiedLevel := -1
+		isShared := false
+		isExternal := false
+		if i < len(lr.local) {
+			// local file.
+			m = lr.local[i].tableMetadata
+		} else if (i - len(lr.local)) < len(lr.shared) {
+			// shared file.
+			isShared = true
+			sharedIdx := i - len(lr.local)
+			m = lr.shared[sharedIdx].tableMetadata
+			specifiedLevel = int(lr.shared[sharedIdx].shared.Level)
+		} else {
+			// external file.
+			isExternal = true
+			externalIdx := i - (len(lr.local) + len(lr.shared))
+			m = lr.external[externalIdx].tableMetadata
+			if lr.externalFilesHaveLevel {
+				specifiedLevel = int(lr.external[externalIdx].external.Level)
+			}
+		}
+
+		// Add to CreatedBackingTables if this is a new backing.
+		//
+		// Shared files always have a new backing. External files have new backings
+		// iff the backing disk file num and the file num match (see ingestAttachRemote).
+		if isShared || (isExternal && m.FileBacking.DiskFileNum == base.DiskFileNum(m.FileNum)) {
+			ve.CreatedBackingTables = append(ve.CreatedBackingTables, m.FileBacking)
+		}
+
+		f := &ve.NewTables[i]
+		var err error
+		if specifiedLevel != -1 {
+			f.Level = specifiedLevel
+		} else {
+			var splitTable *tableMetadata
+			if exciseSpan.Valid() && exciseSpan.Contains(d.cmp, m.Smallest) && exciseSpan.Contains(d.cmp, m.Largest) {
+				// This file fits perfectly within the excise span. We can slot it at
+				// L6, or sharedLevelsStart - 1 if we have shared files.
+				if len(lr.shared) > 0 || lr.externalFilesHaveLevel {
+					f.Level = sharedLevelsStart - 1
+					if baseLevel > f.Level {
+						f.Level = 0
+					}
+				} else {
+					f.Level = 6
+				}
+			} else {
+				// We check overlap against the LSM without holding DB.mu. Note that we
+				// are still holding the log lock, so the version cannot change.
+				// TODO(radu): perform this check optimistically outside of the log lock.
+				//var lsmOverlap overlap.WithLSM
+				//lsmOverlap, err = func() (overlap.WithLSM, error) {
+				//	d.mu.Unlock()
+				//	defer d.mu.Lock()
+				//	return overlapChecker.DetermineLSMOverlap(ctx, m.UserKeyBounds())
+				//}()
+				if err == nil {
+					//f.Level, splitTable, err = ingestTargetLevel(
+					//	ctx, d.cmp, lsmOverlap, baseLevel, d.mu.compact.inProgress, m, shouldIngestSplit,
+					//)
+					f.Level = level
+					splitTable = nil
 				}
 			}
 

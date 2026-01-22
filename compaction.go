@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/cockroachdb/pebble/internal/pmtinternal"
 	"math"
 	"runtime/pprof"
 	"slices"
@@ -144,6 +145,7 @@ const (
 	compactionKindTombstoneDensity
 	compactionKindRewrite
 	compactionKindIngestedFlushable
+	compactionKindFlushMultilevel
 )
 
 func (k compactionKind) String() string {
@@ -168,6 +170,8 @@ func (k compactionKind) String() string {
 		return "ingested-flushable"
 	case compactionKindCopy:
 		return "copy"
+	case compactionKindFlushMultilevel:
+		return "flush-multilevel"
 	}
 	return "?"
 }
@@ -185,6 +189,8 @@ type compaction struct {
 	// operation. In this case kind is compactionKindCopy or
 	// compactionKindRewrite.
 	isDownload bool
+	// set by compact1.
+	jobID JobID
 
 	cmp       Compare
 	equal     Equal
@@ -378,36 +384,40 @@ func newCompaction(
 	)
 	c.kind = pc.kind
 
-	if c.kind == compactionKindDefault && c.outputLevel.files.Empty() && !c.hasExtraLevelData() &&
-		c.startLevel.files.Len() == 1 && c.grandparents.SizeSum() <= c.maxOverlapBytes {
-		// This compaction can be converted into a move or copy from one level
-		// to the next. We avoid such a move if there is lots of overlapping
-		// grandparent data. Otherwise, the move could create a parent file
-		// that will require a very expensive merge later on.
-		iter := c.startLevel.files.Iter()
-		meta := iter.First()
-		isRemote := false
-		// We should always be passed a provider, except in some unit tests.
-		if provider != nil {
-			isRemote = !objstorage.IsLocalTable(provider, meta.FileBacking.DiskFileNum)
-		}
-		// Avoid a trivial move or copy if all of these are true, as rewriting a
-		// new file is better:
-		//
-		// 1) The source file is a virtual sstable
-		// 2) The existing file `meta` is on non-remote storage
-		// 3) The output level prefers shared storage
-		mustCopy := !isRemote && remote.ShouldCreateShared(opts.Experimental.CreateOnShared, c.outputLevel.level)
-		if mustCopy {
-			// If the source is virtual, it's best to just rewrite the file as all
-			// conditions in the above comment are met.
-			if !meta.Virtual {
-				c.kind = compactionKindCopy
+	// DISABLED: Move compaction is disabled
+	// Original logic commented out to force normal compaction
+	/*
+		if c.kind == compactionKindDefault && c.outputLevel.files.Empty() && !c.hasExtraLevelData() &&
+			c.startLevel.files.Len() == 1 && c.grandparents.SizeSum() <= c.maxOverlapBytes {
+			// This compaction can be converted into a move or copy from one level
+			// to the next. We avoid such a move if there is lots of overlapping
+			// grandparent data. Otherwise, the move could create a parent file
+			// that will require a very expensive merge later on.
+			iter := c.startLevel.files.Iter()
+			meta := iter.First()
+			isRemote := false
+			// We should always be passed a provider, except in some unit tests.
+			if provider != nil {
+				isRemote = !objstorage.IsLocalTable(provider, meta.FileBacking.DiskFileNum)
 			}
-		} else {
-			c.kind = compactionKindMove
+			// Avoid a trivial move or copy if all of these are true, as rewriting a
+			// new file is better:
+			//
+			// 1) The source file is a virtual sstable
+			// 2) The existing file `meta` is on non-remote storage
+			// 3) The output level prefers shared storage
+			mustCopy := !isRemote && remote.ShouldCreateShared(opts.Experimental.CreateOnShared, c.outputLevel.level)
+			if mustCopy {
+				// If the source is virtual, it's best to just rewrite the file as all
+				// conditions in the above comment are met.
+				if !meta.Virtual {
+					c.kind = compactionKindCopy
+				}
+			} else {
+				c.kind = compactionKindMove
+			}
 		}
-	}
+	*/
 	return c
 }
 
@@ -629,13 +639,17 @@ func (c *compaction) hasExtraLevelData() bool {
 	if len(c.extraLevels) == 0 {
 		// not a multi level compaction
 		return false
-	} else if c.extraLevels[0].files.Empty() {
-		// a multi level compaction without data in the intermediate input level;
-		// e.g. for a multi level compaction with levels 4,5, and 6, this could
-		// occur if there is no files to compact in 5, or in 5 and 6 (i.e. a move).
-		return false
 	}
-	return true
+	// Check if any extra level has data
+	for _, extraLevel := range c.extraLevels {
+		if !extraLevel.files.Empty() {
+			return true
+		}
+	}
+	// a multi level compaction without data in the intermediate input levels;
+	// e.g. for a multi level compaction with levels 4,5, and 6, this could
+	// occur if there is no files to compact in 5, or in 5 and 6 (i.e. a move).
+	return false
 }
 
 // errorOnUserKeyOverlap returns an error if the last two written sstables in
@@ -707,9 +721,10 @@ func (c *compaction) newInputIters(
 			}
 		}
 		if len(c.extraLevels) > 0 {
-			if len(c.extraLevels) > 1 {
-				panic("n>2 multi level compaction not implemented yet")
-			}
+			//if len(c.extraLevels) > 1 {
+			//	panic("n>2 multi level compaction not implemented yet")
+			//}
+			// 实际上没有必要检查, 所以不改动了
 			interLevel := c.extraLevels[0]
 			err := manifest.CheckOrdering(c.cmp, c.formatKey,
 				manifest.Level(interLevel.level), interLevel.files.Iter())
@@ -751,6 +766,138 @@ func (c *compaction) newInputIters(
 		logger:   c.logger,
 	}
 
+	if pmtinternal.EnablePMT {
+		// just copy code from both flush and compact
+		for i := range c.flushing {
+			f := c.flushing[i]
+			iters = append(iters, f.newFlushIter(nil))
+			rangeDelIter := f.newRangeDelIter(nil)
+			if rangeDelIter != nil {
+				rangeDelIters = append(rangeDelIters, rangeDelIter)
+			}
+			if rangeKeyIter := f.newRangeKeyIter(nil); rangeKeyIter != nil {
+				rangeKeyIters = append(rangeKeyIters, rangeKeyIter)
+			}
+		}
+		addItersForLevel := func(level *compactionLevel, l manifest.Layer) error {
+			// Add a *levelIter for point iterators. Because we don't call
+			// initRangeDel, the levelIter will close and forget the range
+			// deletion iterator when it steps on to a new file. Surfacing range
+			// deletions to compactions are handled below.
+			iters = append(iters, newLevelIter(context.Background(),
+				iterOpts, c.comparer, newIters, level.files.Iter(), l, iiopts))
+			// TODO(jackson): Use keyspanimpl.LevelIter to avoid loading all the range
+			// deletions into memory upfront. (See #2015, which reverted this.) There
+			// will be no user keys that are split between sstables within a level in
+			// Cockroach 23.1, which unblocks this optimization.
+
+			// Add the range deletion iterator for each file as an independent level
+			// in mergingIter, as opposed to making a levelIter out of those. This
+			// is safer as levelIter expects all keys coming from underlying
+			// iterators to be in order. Due to compaction / tombstone writing
+			// logic in finishOutput(), it is possible for range tombstones to not
+			// be strictly ordered across all files in one level.
+			//
+			// Consider this example from the metamorphic tests (also repeated in
+			// finishOutput()), consisting of three L3 files with their bounds
+			// specified in square brackets next to the file name:
+			//
+			// ./000240.sst   [tmgc#391,MERGE-tmgc#391,MERGE]
+			// tmgc#391,MERGE [786e627a]
+			// tmgc-udkatvs#331,RANGEDEL
+			//
+			// ./000241.sst   [tmgc#384,MERGE-tmgc#384,MERGE]
+			// tmgc#384,MERGE [666c7070]
+			// tmgc-tvsalezade#383,RANGEDEL
+			// tmgc-tvsalezade#331,RANGEDEL
+			//
+			// ./000242.sst   [tmgc#383,RANGEDEL-tvsalezade#72057594037927935,RANGEDEL]
+			// tmgc-tvsalezade#383,RANGEDEL
+			// tmgc#375,SET [72646c78766965616c72776865676e79]
+			// tmgc-tvsalezade#356,RANGEDEL
+			//
+			// Here, the range tombstone in 000240.sst falls "after" one in
+			// 000241.sst, despite 000240.sst being ordered "before" 000241.sst for
+			// levelIter's purposes. While each file is still consistent before its
+			// bounds, it's safer to have all rangedel iterators be visible to
+			// mergingIter.
+			iter := level.files.Iter()
+			for f := iter.First(); f != nil; f = iter.Next() {
+				rangeDelIter, err := c.newRangeDelIter(newIters, iter.Take(), iterOpts, iiopts, l)
+				if err != nil {
+					// The error will already be annotated with the BackingFileNum, so
+					// we annotate it with the FileNum.
+					return errors.Wrapf(err, "pebble: could not open table %s", errors.Safe(f.FileNum))
+				}
+				if rangeDelIter == nil {
+					continue
+				}
+				rangeDelIters = append(rangeDelIters, rangeDelIter)
+				c.closers = append(c.closers, rangeDelIter)
+			}
+
+			// Check if this level has any range keys.
+			hasRangeKeys := false
+			for f := iter.First(); f != nil; f = iter.Next() {
+				if f.HasRangeKeys {
+					hasRangeKeys = true
+					break
+				}
+			}
+			if hasRangeKeys {
+				newRangeKeyIterWrapper := func(ctx context.Context, file *manifest.TableMetadata, iterOptions keyspan.SpanIterOptions) (keyspan.FragmentIterator, error) {
+					rangeKeyIter, err := newRangeKeyIter(ctx, file, iterOptions)
+					if err != nil {
+						return nil, err
+					} else if rangeKeyIter == nil {
+						return emptyKeyspanIter, nil
+					}
+					// Ensure that the range key iter is not closed until the compaction is
+					// finished. This is necessary because range key processing
+					// requires the range keys to be held in memory for up to the
+					// lifetime of the compaction.
+					noCloseIter := &noCloseIter{rangeKeyIter}
+					c.closers = append(c.closers, noCloseIter)
+
+					// We do not need to truncate range keys to sstable boundaries, or
+					// only read within the file's atomic compaction units, unlike with
+					// range tombstones. This is because range keys were added after we
+					// stopped splitting user keys across sstables, so all the range keys
+					// in this sstable must wholly lie within the file's bounds.
+					return noCloseIter, err
+				}
+				li := keyspanimpl.NewLevelIter(
+					context.Background(), keyspan.SpanIterOptions{}, c.cmp,
+					newRangeKeyIterWrapper, level.files.Iter(), l, manifest.KeyTypeRange,
+				)
+				rangeKeyIters = append(rangeKeyIters, li)
+			}
+			return nil
+		}
+		for i := range c.inputs {
+			// Skip levels with level < 0 (e.g., flush from memtable)
+			if c.inputs[i].level < 0 {
+				continue
+			}
+			// If the level is annotated with l0SublevelInfo, expand it into one
+			// level per sublevel.
+			// TODO(jackson): Perform this expansion even earlier when we pick the
+			// compaction?
+			if len(c.inputs[i].l0SublevelInfo) > 0 {
+				for _, info := range c.startLevel.l0SublevelInfo {
+					sublevelCompactionLevel := &compactionLevel{0, info.LevelSlice, nil}
+					if err := addItersForLevel(sublevelCompactionLevel, info.sublevel); err != nil {
+						return nil, nil, nil, err
+					}
+				}
+				continue
+			}
+			if err := addItersForLevel(&c.inputs[i], manifest.Level(c.inputs[i].level)); err != nil {
+				return nil, nil, nil, err
+			}
+		}
+		goto replaceLogic
+	}
 	// Populate iters, rangeDelIters and rangeKeyIters with the appropriate
 	// constituent iterators. This depends on whether this is a flush or a
 	// compaction.
@@ -884,7 +1031,7 @@ func (c *compaction) newInputIters(
 			}
 		}
 	}
-
+replaceLogic:
 	// If there's only one constituent point iterator, we can avoid the overhead
 	// of a *mergingIter. This is possible, for example, when performing a flush
 	// of a single memtable. Otherwise, combine all the iterators into a merging
@@ -1223,7 +1370,9 @@ func (d *DB) flush() {
 		d.opts.Experimental.CompactionScheduler.UpdateGetAllowedWithoutPermission()
 		// The flush may have produced too many files in a level, so schedule a
 		// compaction if needed.
-		d.maybeScheduleCompaction()
+		if !pmtinternal.EnablePMT {
+			d.maybeScheduleCompaction()
+		}
 		d.mu.compact.cond.Broadcast()
 	})
 }
@@ -2422,6 +2571,7 @@ func (d *DB) compact1(c *compaction, errChannel chan error) (err error) {
 	}
 
 	jobID := d.newJobIDLocked()
+	c.jobID = jobID // Store jobID for?
 	info := c.makeInfo(jobID)
 	d.opts.EventListener.CompactionBegin(info)
 	startTime := d.timeNow()
@@ -2905,6 +3055,9 @@ func (d *DB) runDeleteOnlyCompaction(
 func (d *DB) runMoveCompaction(
 	jobID JobID, c *compaction,
 ) (ve *versionEdit, stats compact.Stats, _ error) {
+	if pmtinternal.EnablePMT {
+		panic(`pmt want no move compaction`)
+	}
 	iter := c.startLevel.files.Iter()
 	meta := iter.First()
 	if iter.Next() != nil {
@@ -2961,8 +3114,8 @@ func (d *DB) runCompaction(
 		d.mu.Unlock()
 		defer d.mu.Lock()
 		return d.runDeleteOnlyCompaction(jobID, c, snapshots)
-	case compactionKindMove:
-		return d.runMoveCompaction(jobID, c)
+	//case compactionKindMove:
+	//	return d.runMoveCompaction(jobID, c)
 	case compactionKindCopy:
 		return d.runCopyCompaction(jobID, c)
 	case compactionKindIngestedFlushable:
@@ -2987,6 +3140,9 @@ func (d *DB) runCompaction(
 	// the current format major version of the DB, but Options may define
 	// additional constraints.
 	tableFormat := d.TableFormat()
+	//if pmtinternal.EnablePMT {
+	//	tableFormat = sstable.TableFormatPMT0
+	//}
 
 	// Release the d.mu lock while doing I/O.
 	// Note the unusual order: Unlock and then Lock.
@@ -3153,19 +3309,24 @@ func (c *compaction) makeVersionEdit(result compact.Result) (*versionEdit, error
 		BytesIn:   startLevelBytes,
 		BytesRead: c.outputLevel.files.SizeSum(),
 	}
-	if len(c.extraLevels) > 0 {
-		outputMetrics.BytesIn += c.extraLevels[0].files.SizeSum()
+	// Accumulate bytes from all extra levels
+	for _, extraLevel := range c.extraLevels {
+		outputMetrics.BytesIn += extraLevel.files.SizeSum()
 	}
 	outputMetrics.BytesRead += outputMetrics.BytesIn
 
 	c.metrics = map[int]*LevelMetrics{
 		c.outputLevel.level: outputMetrics,
 	}
+	// 实际上只有outputMetrics有用, startLevel和extraLevel的统计信息一直为空
 	if len(c.flushing) == 0 && c.metrics[c.startLevel.level] == nil {
 		c.metrics[c.startLevel.level] = &LevelMetrics{}
 	}
 	if len(c.extraLevels) > 0 {
-		c.metrics[c.extraLevels[0].level] = &LevelMetrics{}
+		// Create metrics for all extra levels
+		for _, extraLevel := range c.extraLevels {
+			c.metrics[extraLevel.level] = &LevelMetrics{}
+		}
 		outputMetrics.MultiLevel.BytesInTop = startLevelBytes
 		outputMetrics.MultiLevel.BytesIn = outputMetrics.BytesIn
 		outputMetrics.MultiLevel.BytesRead = outputMetrics.BytesRead

@@ -208,6 +208,17 @@ func (s *OutputSplitter) setNextBoundary(nextGrandparent *manifest.TableMetadata
 func (s *OutputSplitter) ShouldSplitBefore(
 	nextUserKey []byte, estimatedFileSize uint64, equalPrevFn func([]byte) bool,
 ) ShouldSplit {
+	if s.limit != nil && s.cmp(nextUserKey, s.limit) >= 0 {
+		s.splitKey = s.limit
+		return SplitNow
+	}
+	if estimatedFileSize >= s.targetFileSize {
+		s.splitKey = slices.Clone(nextUserKey)
+		return SplitNow
+	}
+	// TODO: target size?
+	return NoSplit
+
 	if invariants.Enabled && s.splitKey != nil {
 		panic("ShouldSplitBefore called after it returned SplitNow")
 	}

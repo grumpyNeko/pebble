@@ -304,3 +304,28 @@ func panicIfErr(err error) {
 		panic(err)
 	}
 }
+
+func MyBuildForIngest(
+	t *Test, dbID objID, b *pebble.Batch, i int,
+) (path string, _ *sstable.WriterMetadata, _ error) {
+	path = t.opts.FS.PathJoin(t.tmpDir, fmt.Sprintf("ext%d-%d", dbID.slot(), i))
+	f, err := t.opts.FS.Create(path, vfs.WriteCategoryUnspecified)
+	if err != nil {
+		return "", nil, err
+	}
+	db := t.getDB(dbID)
+
+	iter, rangeDelIter, rangeKeyIter := private.BatchSort(b)
+
+	writable := objstorageprovider.NewFileWritable(f)
+	meta, err := writeSSTForIngestion(
+		t,
+		iter, rangeDelIter, rangeKeyIter,
+		false, /* uniquePrefixes */
+		nil,   /* syntheticSuffix */
+		nil,   /* syntheticPrefix */
+		writable,
+		db.FormatMajorVersion(),
+	)
+	return path, meta, err
+}
