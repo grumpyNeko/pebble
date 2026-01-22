@@ -59,6 +59,8 @@ func Test_sst_meta(t *testing.T) {
 			println(fmt.Sprintf("L%d %+v", i, m))
 		}
 	}
+	// L0 000008
+	// L6 000007
 }
 
 func Test_MyGet(t *testing.T) {
