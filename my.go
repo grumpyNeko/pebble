@@ -10,10 +10,8 @@ import (
 	"github.com/cockroachdb/pebble/internal/pmtinternal"
 	"github.com/cockroachdb/pebble/internal/private"
 	"github.com/cockroachdb/pebble/internal/rangekey"
-	"github.com/cockroachdb/pebble/internal/sstableinternal"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
-	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/samber/lo"
@@ -462,6 +460,7 @@ func stat(db *DB) *Metrics {
 func use(arg ...any) {}
 
 // from manualCompact
+// 手动compact，现在没什么用了
 func (d *DB) MyCompact(start, end []byte, inputLevel int) {
 	// TODO: 限制在start和end内
 	d.mu.Lock()
@@ -491,53 +490,6 @@ func (d *DB) MyCompact(start, end []byte, inputLevel int) {
 	}
 }
 
-// 原先的想法是生成SST
-// 只是创建writer
-// 已经无用了, 准备删掉
-func (d *DB) my_newCompactionOutput(
-	jobID JobID,
-	level int,
-) (objstorage.ObjectMetadata, sstable.RawWriter) {
-	writerOpts := d.opts.MakeWriterOptions(level, d.TableFormat())
-
-	diskFileNum := d.mu.versions.getNextDiskFileNum()
-
-	// Prefer shared storage if present.
-	createOpts := objstorage.CreateOptions{
-		PreferSharedStorage: remote.ShouldCreateShared(d.opts.Experimental.CreateOnShared, level),
-		WriteCategory:       "pebble-memtable-flush",
-	}
-	writable, objMeta, err := d.objProvider.Create(context.TODO(), base.FileTypeTable, diskFileNum, createOpts)
-	if err != nil {
-		panic(err)
-	}
-
-	d.opts.EventListener.TableCreated(TableCreateInfo{
-		JobID:   int(jobID),
-		Reason:  "flushing",
-		Path:    d.objProvider.Path(objMeta),
-		FileNum: diskFileNum,
-	})
-
-	writerOpts.SetInternal(sstableinternal.WriterOptions{
-		CacheOpts: sstableinternal.CacheOptions{
-			CacheHandle: d.cacheHandle,
-			FileNum:     diskFileNum,
-		},
-	})
-
-	const MaxFileWriteAdditionalCPUTime = time.Millisecond * 100
-	cpuWorkHandle := d.opts.Experimental.CPUWorkPermissionGranter.GetPermission(
-		MaxFileWriteAdditionalCPUTime,
-	)
-	writerOpts.Parallelism =
-		d.opts.Experimental.MaxWriterConcurrency > 0 &&
-			(cpuWorkHandle.Permitted() || d.opts.Experimental.ForceWriterParallelism)
-
-	tw := sstable.NewRawWriter(writable, writerOpts)
-	return objMeta, tw
-}
-
 // ----------------------------------------------------------------------------
 func makeSST(db *DB, path string, keys []uint64) *sstable.WriterMetadata {
 	b := db.NewBatch()
@@ -555,7 +507,7 @@ func makeSST(db *DB, path string, keys []uint64) *sstable.WriterMetadata {
 	defer f.Close()
 	iter, rangeDelIter, rangeKeyIter := private.BatchSort(b)
 	writable := objstorageprovider.NewFileWritable(f)
-	meta, err := writeSSTForIngestion(
+	meta, err := _writeSSTForIngestion(
 		db,
 		iter, rangeDelIter, rangeKeyIter,
 		false, /* uniquePrefixes */
@@ -571,7 +523,7 @@ func makeSST(db *DB, path string, keys []uint64) *sstable.WriterMetadata {
 }
 
 // clone from metamorphic/build.go
-func writeSSTForIngestion(
+func _writeSSTForIngestion(
 	db *DB,
 	pointIter base.InternalIterator,
 	rangeDelIter keyspan.FragmentIterator,
@@ -911,7 +863,9 @@ func rangeLimit(keys []uint64, low uint64, high uint64) []uint64 {
 // a single flush + multi-level compaction
 // Assume batch does not overlap with other files.
 // wait for compaction to finish.
-func multilevelFlush(db *DB, keys []uint64, v uint64, files []base.FileNum, outputLevel int) JobID {
+func multilevelFlush(db *DB, mem fakeMemTable, files []base.FileNum, outputLevel int) JobID {
+	keys := mem.keys
+	v := mem.v
 	if len(keys) == 0 && len(files) == 0 {
 		println("nothing to do")
 		return -1
@@ -995,9 +949,14 @@ func multilevelFlush(db *DB, keys []uint64, v uint64, files []base.FileNum, outp
 	return jobID
 }
 
+type fakeMemTable struct {
+	keys []uint64
+	v    uint64 // common value
+}
+
 // multilevelFlushWithResult runs multilevelFlush and returns the created output file numbers.
-func multilevelFlushWithResult(db *DB, keys []uint64, v uint64, files []base.FileNum, outputLevel int) []uint64 {
-	jobID := multilevelFlush(db, keys, v, files, outputLevel)
+func multilevelFlushWithResult(db *DB, mem fakeMemTable, files []base.FileNum, outputLevel int) []uint64 {
+	jobID := multilevelFlush(db, mem, files, outputLevel)
 
 	// Retrieve results from the map using jobID
 	compactionResultsMu.Lock()

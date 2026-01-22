@@ -162,7 +162,11 @@ func Test_pmt_wa(t *testing.T) {
 
 		spList := plan()
 		for j, sp := range spList {
-			spList[j].Outputs = multilevelFlushWithResult(db, rangeLimit(d.Keys, sp.low, sp.High), uint64(i), sp.Stack[sp.WriteTo:], int(manifest.NumLevels-1-sp.WriteTo))
+			mem := fakeMemTable{
+				keys: rangeLimit(d.Keys, sp.low, sp.High),
+				v:    uint64(i),
+			}
+			spList[j].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], int(manifest.NumLevels-1-sp.WriteTo))
 		}
 		pmtinternal.PartIdx = newPartIdxFromSubParts(spList)
 		println(fmt.Sprintf("done %d", i))
@@ -277,7 +281,7 @@ func Test_make_sst(t *testing.T) {
 }
 
 // 放进指定level，触发multilevel compact
-func Test_ingest1(t *testing.T) {
+func Test_MustIngestToLevel(t *testing.T) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		panic("")
@@ -312,7 +316,11 @@ func Test_multilevelFlush(t *testing.T) {
 	}
 	keys := []uint64{0, 20}
 	for i, sp := range spList {
-		spList[i].Outputs = multilevelFlushWithResult(db, rangeLimit(keys, sp.low, sp.High), 1, sp.Stack[sp.WriteTo:], int(manifest.NumLevels-1-sp.WriteTo))
+		mem := fakeMemTable{
+			keys: rangeLimit(keys, sp.low, sp.High),
+			v:    1,
+		}
+		spList[i].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], int(manifest.NumLevels-1-sp.WriteTo))
 	}
 	pmtinternal.PartIdx = newPartIdxFromSubParts(spList)
 	println(db.LSMViewURL())
@@ -335,7 +343,11 @@ func Test_multilevelFlush(t *testing.T) {
 	}
 	keys = []uint64{1, 2, 32}
 	for i, sp := range spList {
-		spList[i].Outputs = multilevelFlushWithResult(db, rangeLimit(keys, sp.low, sp.High), 2, sp.Stack[sp.WriteTo:], int(manifest.NumLevels-1-sp.WriteTo))
+		mem := fakeMemTable{
+			keys: rangeLimit(keys, sp.low, sp.High),
+			v:    2,
+		}
+		spList[i].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], int(manifest.NumLevels-1-sp.WriteTo))
 	}
 	pmtinternal.PartIdx = newPartIdxFromSubParts(spList)
 	println(db.LSMViewURL())
@@ -365,7 +377,11 @@ func Test_multilevelFlush(t *testing.T) {
 	}
 	keys = []uint64{16, 32}
 	for i, sp := range spList {
-		spList[i].Outputs = multilevelFlushWithResult(db, rangeLimit(keys, sp.low, sp.High), 3, sp.Stack[sp.WriteTo:], int(manifest.NumLevels-1-sp.WriteTo))
+		mem := fakeMemTable{
+			keys: rangeLimit(keys, sp.low, sp.High),
+			v:    3,
+		}
+		spList[i].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], int(manifest.NumLevels-1-sp.WriteTo))
 	}
 	pmtinternal.PartIdx = newPartIdxFromSubParts(spList)
 	println(db.LSMViewURL())
