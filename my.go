@@ -682,7 +682,7 @@ func _writeSSTForIngestion(
 	return sstMeta, nil
 }
 
-// ----------------------------------------------------------------------------
+// ---------pmt features start----------------
 func isCompacting(d *DB) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -693,9 +693,9 @@ func isCompacting(d *DB) bool {
 	return ret
 }
 
-// newPickedFilesCompaction creates a pickedCompaction from a list of file numbers.
+// _newPickedFilesCompaction creates a pickedCompaction from a list of file numbers.
 // no checking for overlaps.
-func newPickedFilesCompaction(
+func _newPickedFilesCompaction(
 	vers *version,
 	opts *Options,
 	fileNums []base.FileNum,
@@ -879,7 +879,7 @@ func multilevelFlush(db *DB, mem fakeMemTable, files []base.FileNum, outputLevel
 	kind := compactionKindFlushMultilevel
 	opts := db.opts
 	vers := db.mu.versions.currentVersion()
-	pc := newPickedFilesCompaction(vers, opts, files, outputLevel, baseLevel, kind)
+	pc := _newPickedFilesCompaction(vers, opts, files, outputLevel, baseLevel, kind)
 	if pc == nil {
 		// 说明只flush
 		adjusted := adjustedOutputLevel(outputLevel, baseLevel)
@@ -921,16 +921,12 @@ func multilevelFlush(db *DB, mem fakeMemTable, files []base.FileNum, outputLevel
 		comp.flushing[0] = db.newFlushableEntry(flushableMem, base.DiskFileNum(0), seqNum)
 	}
 
-	// Create manual compaction structure
 	c := &manualCompaction{
 		done: make(chan error, 1),
 	}
 	db.mu.compact.manualID++
 	db.mu.compact.compactingCount++
-
-	// Add to in-progress compactions
 	db.addInProgressCompaction(comp)
-
 	db.mu.Unlock()
 
 	db.compact(comp, c.done)
