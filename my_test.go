@@ -9,6 +9,7 @@ import (
 	"github.com/cockroachdb/pebble/vfs"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"testing"
@@ -221,6 +222,22 @@ func Test_pmt_wa(t *testing.T) {
 	//	}
 	//}
 	//println(time.Now().Sub(start).Milliseconds())
+}
+
+func Test_gen_data(t *testing.T) {
+	const times = 128
+	deviation := uint64(1 << 32)
+	dir := "pmttestdata"
+	for i := 0; i < times; i++ {
+		d := NewData()
+		mean := 1024*math.MaxUint32 + uint64(i)*(math.MaxUint32)
+		d = d.AddNormal(mean, deviation, 1<<20, MinKey+1, MaxKey-1)
+		d = d.AddUniform(MinKey+1, MaxKey-1, 1024)
+		d = d.AddMinMax()
+		sort.Slice(d.Keys, func(i, j int) bool { return d.Keys[i] < d.Keys[j] })
+		path := filepath.Join(dir, fmt.Sprintf("normal_round_%03d.bin", i))
+		SaveDataFile(path, d)
+	}
 }
 
 func multilevelFlushConcurrent(db *DB, keys []uint64, v uint64, spList []SubPart, concurrency int) {

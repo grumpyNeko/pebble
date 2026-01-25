@@ -2,12 +2,11 @@ package pebble
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/binary"
-	"io"
 	"math"
 	"math/rand"
 	"os"
+	"path/filepath"
 )
 
 var genKeysR = rand.New(rand.NewSource(1))
@@ -119,19 +118,16 @@ func (d *Data) Dump(filename string) {
 }
 
 func Load(filename string) *Data {
-	file, err := os.Open(filename)
+	stat, err := os.Stat(filename)
 	if err != nil {
 		panic(err)
 	}
-	defer file.Close()
-
-	stat, err := file.Stat()
-	if err != nil {
-		panic(err)
+	if stat.Size()%8 != 0 {
+		panic("invalid file size")
 	}
-	count := stat.Size() / int64(binary.Size(uint64(0)))
+	count := stat.Size() / 8
 
-	fileBytes, err := io.ReadAll(file)
+	fileBytes, err := os.ReadFile(filename)
 	if err != nil {
 		panic(err)
 	}
@@ -140,18 +136,78 @@ func Load(filename string) *Data {
 		Keys: make([]uint64, 0, count),
 		M:    make(map[uint64]struct{}, count),
 	}
-	reader := bytes.NewReader(fileBytes)
-	for {
-		var k uint64
-		err := binary.Read(reader, binary.LittleEndian, &k)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			panic(err)
-		}
+	for i := int64(0); i < count; i++ {
+		base := i * 8
+		k := binary.LittleEndian.Uint64(fileBytes[base : base+8])
 		data.Keys = append(data.Keys, k)
 		data.M[k] = struct{}{}
 	}
 	return data
+}
+
+const (
+	pmtDatasetFileMode  = 0o755
+	pmtDatasetWriteMode = 0o644
+	pmtDataKeysPerFile  = 1 << 20
+)
+
+// one-file-per-Data(exactly 1M uint64)
+func SaveDataFile(filename string, d *Data) {
+	if d == nil {
+		panic("nil data")
+	}
+	if len(d.Keys) != pmtDataKeysPerFile {
+		panic("invalid data size")
+	}
+	dir := filepath.Dir(filename)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, pmtDatasetFileMode); err != nil {
+			panic(err)
+		}
+	}
+
+	file, err := os.OpenFile(filename, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, pmtDatasetWriteMode)
+	if err != nil {
+		panic(err)
+	}
+	defer file.Close()
+
+	writer := bufio.NewWriter(file)
+	for _, k := range d.Keys {
+		if err := binary.Write(writer, binary.LittleEndian, k); err != nil {
+			panic(err)
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		panic(err)
+	}
+}
+
+// LoadDataFile reads a single Data (1M uint64 keys) from disk.
+func LoadDataFile(filename string) *Data {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		panic(err)
+	}
+	if len(data)%8 != 0 {
+		panic("invalid dataset: size not aligned")
+	}
+	count := len(data) / 8
+	if count != pmtDataKeysPerFile {
+		panic("invalid dataset: unexpected key count")
+	}
+	keys := make([]uint64, count)
+	for i := 0; i < count; i++ {
+		base := i * 8
+		keys[i] = binary.LittleEndian.Uint64(data[base : base+8])
+	}
+	ret := &Data{
+		Keys: keys,
+		M:    make(map[uint64]struct{}, count),
+		Size: count,
+	}
+	for _, k := range keys {
+		ret.M[k] = struct{}{}
+	}
+	return ret
 }
