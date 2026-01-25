@@ -357,7 +357,10 @@ func MustDB(list ...OptionPatch) *DB {
 	return db
 }
 
-func (d *DB) MyGet(key []byte) ([]byte, int) {
+// like getInternal
+// panic if not found
+// return filesAccessed
+func (d *DB) MustGet(key []byte) ([]byte, int) {
 	if err := d.closed.Load(); err != nil {
 		panic(err)
 	}
@@ -870,8 +873,21 @@ func multilevelFlush(db *DB, mem fakeMemTable, files []base.FileNum, outputLevel
 		println("nothing to do")
 		return -1
 	}
+	// 用于研究concurrent multi flush
+	if isCompacting(db) {
+		db.mu.Lock()
+		compacting := db.mu.compact.compactingCount
+		downloading := db.mu.compact.downloadingCount
+		flushing := db.mu.compact.flushing
+		inProgress := len(db.mu.compact.inProgress)
+		db.mu.Unlock()
+		println(fmt.Sprintf(
+			"multilevelFlush: another compaction in progress (compacting=%d downloading=%d flushing=%v inProgress=%d)",
+			compacting, downloading, flushing, inProgress,
+		))
+	}
 	db.mu.Lock()
-	// Create an in-memory iterator for new keys
+	// Create an iterator for mem
 	seqNum := db.mu.versions.logSeqNum.Add(1) - 1
 	memIter := newSimpleMemIter(keys, v, seqNum)
 
@@ -880,17 +896,16 @@ func multilevelFlush(db *DB, mem fakeMemTable, files []base.FileNum, outputLevel
 	opts := db.opts
 	vers := db.mu.versions.currentVersion()
 	pc := _newPickedFilesCompaction(vers, opts, files, outputLevel, baseLevel, kind)
-	if pc == nil {
-		// 说明只flush
-		adjusted := adjustedOutputLevel(outputLevel, baseLevel)
+	if pc == nil { // 说明只flush
+		// Pebble原流程涉及adjustedOutputLevel, 此处暂时去掉
 		pc = &pickedCompaction{
 			cmp:                    opts.Comparer.Compare,
 			version:                vers,
 			baseLevel:              baseLevel,
 			kind:                   kind,
-			maxOutputFileSize:      uint64(opts.Level(adjusted).TargetFileSize),
-			maxOverlapBytes:        maxGrandparentOverlapBytes(opts, adjusted),
-			maxReadCompactionBytes: maxReadCompactionBytes(opts, adjusted),
+			maxOutputFileSize:      uint64(opts.Level(outputLevel).TargetFileSize),
+			maxOverlapBytes:        maxGrandparentOverlapBytes(opts, outputLevel),
+			maxReadCompactionBytes: maxReadCompactionBytes(opts, outputLevel),
 			inputs:                 []compactionLevel{{level: -1}, {level: outputLevel}},
 		}
 		pc.startLevel = &pc.inputs[0]
@@ -952,6 +967,9 @@ type fakeMemTable struct {
 
 // multilevelFlushWithResult runs multilevelFlush and returns the created output file numbers.
 func multilevelFlushWithResult(db *DB, mem fakeMemTable, files []base.FileNum, outputLevel int) []uint64 {
+	if outputLevel < 0 {
+		panic(`outputLevel < 0`)
+	}
 	jobID := multilevelFlush(db, mem, files, outputLevel)
 
 	// Retrieve results from the map using jobID

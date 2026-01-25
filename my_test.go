@@ -8,9 +8,9 @@ import (
 	"github.com/cockroachdb/pebble/internal/pmtinternal"
 	"github.com/cockroachdb/pebble/vfs"
 	"math"
-	"math/rand/v2"
 	"os"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 )
@@ -71,10 +71,10 @@ func Test_MyGet(t *testing.T) {
 	batchWrite(db, []uint64{1, 100}, uint64(1))
 	batchWrite(db, []uint64{0, 101}, uint64(2))
 	var tables int
-	_, tables = db.MyGet(BigEndian(0))
-	_, tables = db.MyGet(BigEndian(101))
-	_, tables = db.MyGet(BigEndian(1))
-	_, tables = db.MyGet(BigEndian(100))
+	_, tables = db.MustGet(BigEndian(0))
+	_, tables = db.MustGet(BigEndian(101))
+	_, tables = db.MustGet(BigEndian(1))
+	_, tables = db.MustGet(BigEndian(100))
 	use(tables)
 }
 
@@ -148,9 +148,11 @@ func Test_pmt_wa(t *testing.T) {
 		return options
 	})
 
-	times := 128 // 48
+	const flushConcurrency = 4
+	times := 32 // 48
 	deviation := uint64(1 << 32)
 	datas := []uint64{}
+	writeStart := time.Now()
 	for i := 0; i < times; i++ {
 		d := NewData()
 		mean := 1024*math.MaxUint32 + uint64(i)*(math.MaxUint32)
@@ -163,25 +165,30 @@ func Test_pmt_wa(t *testing.T) {
 		datas = append(datas, d.Keys...)
 
 		spList := plan()
-		for j, sp := range spList {
-			mem := fakeMemTable{
-				keys: rangeLimit(d.Keys, sp.low, sp.High),
-				v:    uint64(i),
-			}
-			spList[j].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], int(manifest.NumLevels-1-sp.WriteTo))
-		}
+		//for j, sp := range spList {
+		//	mem := fakeMemTable{
+		//		keys: rangeLimit(d.Keys, sp.low, sp.High),
+		//		v:    uint64(i),
+		//	}
+		//	spList[j].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], int(manifest.NumLevels-1-sp.WriteTo))
+		//}
+		multilevelFlushConcurrent(db, d.Keys, uint64(i), spList, flushConcurrency)
 		pmtinternal.PartIdx = newPartIdxFromSubParts(spList)
 		println(fmt.Sprintf("done %d", i))
 	}
 	for isCompacting(db) {
 		println("wait for compact")
-		time.Sleep(10 * time.Second)
+		time.Sleep(1 * time.Second)
 	}
+	println(fmt.Sprintf("写入阶段耗时(ms): %d", time.Since(writeStart).Milliseconds()))
 
 	metrics := stat(db)
 	use(metrics)
 	use(pmtinternal.PartIdx)
 	println(metrics.Total().BytesIn)
+
+	// ------------------------------
+
 	//avg(db)
 
 	// --- get every key ---
@@ -201,18 +208,67 @@ func Test_pmt_wa(t *testing.T) {
 	// pmt 256pagescache nocompression 64round, 0.037516
 
 	// pmt 256pagescache nocompression 128round, 47.1us
-	rand.Shuffle(len(datas), func(i, j int) {
-		datas[i], datas[j] = datas[j], datas[i]
-	})
-	println("start benchmark")
-	start := time.Now()
-	for i := 0; i < 1<<20; i++ {
-		_, _, err := db.Get(BigEndian(datas[i]))
-		if err != nil {
-			println(err.Error())
+
+	//rand.Shuffle(len(datas), func(i, j int) {
+	//	datas[i], datas[j] = datas[j], datas[i]
+	//})
+	//println("start benchmark")
+	//start := time.Now()
+	//for i := 0; i < 1<<20; i++ {
+	//	_, _, err := db.Get(BigEndian(datas[i]))
+	//	if err != nil {
+	//		println(err.Error())
+	//	}
+	//}
+	//println(time.Now().Sub(start).Milliseconds())
+}
+
+func multilevelFlushConcurrent(db *DB, keys []uint64, v uint64, spList []SubPart, concurrency int) {
+	if len(spList) == 0 {
+		return
+	}
+	if concurrency < 1 {
+		panic(`concurrency < 1`)
+	}
+	if len(spList) == 1 {
+		concurrency = 1 // TODO: 这么做不优雅...
+	}
+	if concurrency > len(spList) {
+		panic(`concurrency > len(spList)`)
+	}
+	var wg sync.WaitGroup
+	size := (len(spList) + concurrency - 1) / concurrency
+	groups := make([][]SubPart, 0, concurrency)
+	for g := 0; g < concurrency; g++ {
+		start := g * size
+		end := start + size
+		if end > len(spList) {
+			end = len(spList)
+		}
+		if start < end {
+			groups = append(groups, spList[start:end])
 		}
 	}
-	println(time.Now().Sub(start).Milliseconds())
+	wg.Add(len(groups))
+	for _, group := range groups {
+		go func(list []SubPart) {
+			defer wg.Done()
+			for i := range list {
+				sp := list[i]
+				mem := fakeMemTable{
+					keys: rangeLimit(keys, sp.low, sp.High),
+					v:    v,
+				}
+				list[i].Outputs = multilevelFlushWithResult(
+					db,
+					mem,
+					sp.Stack[sp.WriteTo:],
+					int(manifest.NumLevels-1-sp.WriteTo),
+				)
+			}
+		}(group)
+	}
+	wg.Wait()
 }
 
 /*
@@ -417,20 +473,6 @@ func plan() []SubPart {
 	return ret
 }
 
-// 根据fileNum从当前版本中查找文件元数据
-func getFileBy(db *DB, fileNum uint64) (*manifest.TableMetadata, int) {
-	v := db.DebugCurrentVersion()
-	for level := 0; level < manifest.NumLevels; level++ {
-		it := v.Levels[level].Iter()
-		for m := it.First(); m != nil; m = it.Next() {
-			if uint64(m.FileNum) == fileNum {
-				return m, level
-			}
-		}
-	}
-	return nil, -1
-}
-
 // 打印文件中的所有k
 func printFileContent(db *DB, file *manifest.TableMetadata) {
 	if file == nil {
@@ -490,7 +532,7 @@ func avg(db *DB) {
 
 	for ok := it.First(); ok; ok = it.Next() {
 		ct++
-		_, tables := db.MyGet(it.Key())
+		_, tables := db.MustGet(it.Key())
 		sum += tables
 	}
 	println(fmt.Sprintf("ct:%d, avg:%f", ct, float64(sum)/float64(ct)))
