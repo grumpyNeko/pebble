@@ -8,6 +8,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/pmtinternal"
 	"github.com/cockroachdb/pebble/vfs"
 	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
@@ -149,20 +150,14 @@ func Test_pmt_wa(t *testing.T) {
 		return options
 	})
 
-	const flushConcurrency = 4
-	times := 32 // 48
-	deviation := uint64(1 << 32)
+	const flushConcurrency = 1
+	times := 128 // 48
 	datas := []uint64{}
 	writeStart := time.Now()
+	dir := "pmttestdata"
 	for i := 0; i < times; i++ {
-		d := NewData()
-		mean := 1024*math.MaxUint32 + uint64(i)*(math.MaxUint32)
-		use(mean, deviation)
-		d = d.AddNormal(mean, deviation, 1<<20, MinKey+1, MaxKey-1)
-		d = d.AddUniform(MinKey+1, MaxKey-1, 1024)
-		d = d.AddMinMax()
-		//d = d.AddUniform(MinKey, MaxKey, 1<<20)
-		sort.Slice(d.Keys, func(i, j int) bool { return d.Keys[i] < d.Keys[j] })
+		path := filepath.Join(dir, fmt.Sprintf("normal_plus_round_%03d.bin", i))
+		d := LoadDataFile(path)
 		datas = append(datas, d.Keys...)
 
 		spList := plan()
@@ -209,19 +204,22 @@ func Test_pmt_wa(t *testing.T) {
 	// pmt 256pagescache nocompression 64round, 0.037516
 
 	// pmt 256pagescache nocompression 128round, 47.1us
+	//benchmarkRandomRead(datas, db)
+}
 
-	//rand.Shuffle(len(datas), func(i, j int) {
-	//	datas[i], datas[j] = datas[j], datas[i]
-	//})
-	//println("start benchmark")
-	//start := time.Now()
-	//for i := 0; i < 1<<20; i++ {
-	//	_, _, err := db.Get(BigEndian(datas[i]))
-	//	if err != nil {
-	//		println(err.Error())
-	//	}
-	//}
-	//println(time.Now().Sub(start).Milliseconds())
+func benchmarkRandomRead(datas []uint64, db *DB) {
+	rand.Shuffle(len(datas), func(i, j int) {
+		datas[i], datas[j] = datas[j], datas[i]
+	})
+	println("start benchmark")
+	start := time.Now()
+	for i := 0; i < 1<<20; i++ {
+		_, _, err := db.Get(BigEndian(datas[i]))
+		if err != nil {
+			println(err.Error())
+		}
+	}
+	println(time.Now().Sub(start).Milliseconds())
 }
 
 func Test_gen_data(t *testing.T) {
