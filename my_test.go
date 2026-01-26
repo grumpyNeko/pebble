@@ -235,7 +235,15 @@ func Test_gen_data(t *testing.T) {
 		d = d.AddUniform(MinKey+1, MaxKey-1, 1024)
 		d = d.AddMinMax()
 		sort.Slice(d.Keys, func(i, j int) bool { return d.Keys[i] < d.Keys[j] })
-		path := filepath.Join(dir, fmt.Sprintf("normal_round_%03d.bin", i))
+		path := filepath.Join(dir, fmt.Sprintf("normal_plus_round_%03d.bin", i))
+		SaveDataFile(path, d)
+	}
+	for i := 0; i < times; i++ {
+		d := NewData()
+		d = d.AddUniform(MinKey, MaxKey, 1<<20)
+		d = d.AddMinMax()
+		sort.Slice(d.Keys, func(i, j int) bool { return d.Keys[i] < d.Keys[j] })
+		path := filepath.Join(dir, fmt.Sprintf("uniform_round_%03d.bin", i))
 		SaveDataFile(path, d)
 	}
 }
