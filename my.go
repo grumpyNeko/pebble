@@ -710,9 +710,10 @@ func _newPickedFilesCompaction(
 		file  *manifest.TableMetadata
 		level int
 	}
+	// filesMap, allFiles <: fileNums
 	filesMap := make(map[int][]*manifest.TableMetadata) // level -> files
 	var allFiles []fileWithLevel
-	// 可以直接从pmtinternal.SstMap找吗
+	// 目前还不能直接从pmtinternal.SstMap找
 	for level := 0; level < numLevels; level++ {
 		levelFiles := vers.Levels[level]
 		iter := levelFiles.Iter()
@@ -726,9 +727,8 @@ func _newPickedFilesCompaction(
 			}
 		}
 	}
-
 	if len(allFiles) == 0 {
-		return nil
+		panic("no matching files found for fileNums in current version")
 	}
 
 	// assert
@@ -811,7 +811,7 @@ func _newPickedFilesCompaction(
 			pc.extraLevels[i-1] = &pc.inputs[i]
 		}
 	}
-	// TODO: 以下只涉及文件, 但multiflush还涉及内存里的新数据
+	// 还需在multiflush中增加内存里的新数据
 	pc.smallest, pc.largest = keyrange(lo.Map(allFiles, func(item fileWithLevel, index int) *manifest.TableMetadata {
 		return item.file
 	}), opts)
@@ -896,8 +896,8 @@ func multilevelFlush(db *DB, mem fakeMemTable, files []base.FileNum, outputLevel
 	kind := compactionKindFlushMultilevel
 	opts := db.opts
 	vers := db.mu.versions.currentVersion()
-	pc := _newPickedFilesCompaction(vers, opts, files, outputLevel, baseLevel, kind)
-	if pc == nil { // 说明只flush
+	var pc *pickedCompaction
+	if len(files) == 0 { // 说明只flush
 		// Pebble原流程涉及adjustedOutputLevel, 此处暂时去掉
 		pc = &pickedCompaction{
 			cmp:                    opts.Comparer.Compare,
@@ -911,8 +911,9 @@ func multilevelFlush(db *DB, mem fakeMemTable, files []base.FileNum, outputLevel
 		}
 		pc.startLevel = &pc.inputs[0]
 		pc.outputLevel = &pc.inputs[len(pc.inputs)-1]
+	} else {
+		pc = _newPickedFilesCompaction(vers, opts, files, outputLevel, baseLevel, kind)
 	}
-	// TODO: ...
 	// Update pc.smallest and pc.largest to include memory iterator
 	if memIter != nil && len(memIter.keys) > 0 {
 		memSmallest := memIter.keys[0]
@@ -927,7 +928,7 @@ func multilevelFlush(db *DB, mem fakeMemTable, files []base.FileNum, outputLevel
 	}
 	comp := newCompaction(pc, opts, db.timeNow(), db.objProvider, noopGrantHandle{})
 	if comp == nil {
-		panic(`why?`)
+		panic(`why comp == nil?`)
 	}
 	// Add memory iterator as a flushable
 	if memIter != nil && len(memIter.keys) > 0 {
@@ -937,6 +938,7 @@ func multilevelFlush(db *DB, mem fakeMemTable, files []base.FileNum, outputLevel
 		comp.flushing[0] = db.newFlushableEntry(flushableMem, base.DiskFileNum(0), seqNum)
 	}
 
+	// TODO: 如果不执行以下几行会怎样
 	c := &manualCompaction{
 		done: make(chan error, 1),
 	}
