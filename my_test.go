@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"sync"
 	"testing"
@@ -142,15 +143,17 @@ func Test_pebble_wa(t *testing.T) {
 }
 
 func Test_pmt_wa(t *testing.T) {
+	println(fmt.Sprintf("GOMAXPROCS=%d", runtime.GOMAXPROCS(0)))
 	db := MustDB(func(options *Options) *Options {
 		options.FS = vfs.Default
 		pagesize := 4 << 10                       // 4KB
 		options.CacheSize = int64(512 * pagesize) //
-		options.DisableAutomaticCompactions = false
+		options.DisableAutomaticCompactions = true
+		options.MaxConcurrentCompactions = func() int { return 8 }
 		return options
 	})
 
-	const flushConcurrency = 1
+	const flushConcurrency = 4
 	times := 128 // 48
 	datas := []uint64{}
 	writeStart := time.Now()
@@ -171,10 +174,6 @@ func Test_pmt_wa(t *testing.T) {
 		multilevelFlushConcurrent(db, d.Keys, uint64(i), spList, flushConcurrency)
 		pmtinternal.PartIdx = newPartIdxFromSubParts(spList)
 		println(fmt.Sprintf("done %d", i))
-	}
-	for isCompacting(db) {
-		println("wait for compact")
-		time.Sleep(1 * time.Second)
 	}
 	println(fmt.Sprintf("写入阶段耗时(ms): %d", time.Since(writeStart).Milliseconds()))
 
@@ -205,6 +204,53 @@ func Test_pmt_wa(t *testing.T) {
 
 	// pmt 256pagescache nocompression 128round, 47.1us
 	//benchmarkRandomRead(datas, db)
+}
+
+// 需要用到全局变量testCompactionWriteGate
+func Test_concurrent(t *testing.T) {
+	println(fmt.Sprintf("GOMAXPROCS=%d", runtime.GOMAXPROCS(0)))
+	db := MustDB(func(options *Options) *Options {
+		options.FS = vfs.Default
+		pagesize := 4 << 10                       // 4KB
+		options.CacheSize = int64(512 * pagesize) //
+		options.DisableAutomaticCompactions = true
+		options.MaxConcurrentCompactions = func() int { return 8 }
+		return options
+	})
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		mem := fakeMemTable{
+			keys: []uint64{1, 2, 3},
+			v:    1,
+		}
+		multilevelFlushWithResult(
+			db,
+			mem,
+			nil,
+			0,
+		)
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		mem := fakeMemTable{
+			keys: []uint64{100, 101, 102},
+			v:    2,
+		}
+		multilevelFlushWithResult(
+			db,
+			mem,
+			nil,
+			0,
+		)
+	}()
+	close(start) // 同时起跑
+	wg.Wait()
 }
 
 func benchmarkRandomRead(datas []uint64, db *DB) {
@@ -261,19 +307,17 @@ func multilevelFlushConcurrent(db *DB, keys []uint64, v uint64, spList []SubPart
 	}
 	var wg sync.WaitGroup
 	size := (len(spList) + concurrency - 1) / concurrency
-	groups := make([][]SubPart, 0, concurrency)
 	for g := 0; g < concurrency; g++ {
 		start := g * size
 		end := start + size
 		if end > len(spList) {
 			end = len(spList)
 		}
-		if start < end {
-			groups = append(groups, spList[start:end])
+		if start >= end {
+			continue
 		}
-	}
-	wg.Add(len(groups))
-	for _, group := range groups {
+		list := spList[start:end]
+		wg.Add(1)
 		go func(list []SubPart) {
 			defer wg.Done()
 			for i := range list {
@@ -289,7 +333,7 @@ func multilevelFlushConcurrent(db *DB, keys []uint64, v uint64, spList []SubPart
 					int(manifest.NumLevels-1-sp.WriteTo),
 				)
 			}
-		}(group)
+		}(list)
 	}
 	wg.Wait()
 }

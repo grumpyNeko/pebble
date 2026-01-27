@@ -712,6 +712,7 @@ func _newPickedFilesCompaction(
 	}
 	filesMap := make(map[int][]*manifest.TableMetadata) // level -> files
 	var allFiles []fileWithLevel
+	// 可以直接从pmtinternal.SstMap找吗
 	for level := 0; level < numLevels; level++ {
 		levelFiles := vers.Levels[level]
 		iter := levelFiles.Iter()
@@ -810,7 +811,7 @@ func _newPickedFilesCompaction(
 			pc.extraLevels[i-1] = &pc.inputs[i]
 		}
 	}
-
+	// TODO: 以下只涉及文件, 但multiflush还涉及内存里的新数据
 	pc.smallest, pc.largest = keyrange(lo.Map(allFiles, func(item fileWithLevel, index int) *manifest.TableMetadata {
 		return item.file
 	}), opts)
