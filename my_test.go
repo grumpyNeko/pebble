@@ -206,7 +206,7 @@ func Test_pmt_wa(t *testing.T) {
 	//benchmarkRandomRead(datas, db)
 }
 
-// 需要用到全局变量testCompactionWriteGate
+// 可能需要用全局变量判断
 func Test_concurrent(t *testing.T) {
 	println(fmt.Sprintf("GOMAXPROCS=%d", runtime.GOMAXPROCS(0)))
 	db := MustDB(func(options *Options) *Options {
