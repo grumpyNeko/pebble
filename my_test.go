@@ -13,10 +13,84 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// writeBarrierFS blocks the first write to each sstable until N writers arrive.
+// This is a focused way to prove concurrent "write to disk" overlap.
+type writeBarrierFS struct {
+	vfs.FS
+	b *writeBarrier
+}
+
+type writeBarrier struct {
+	target int32
+	count  int32
+	ch     chan struct{}
+	once   sync.Once
+}
+
+func newWriteBarrier(target int32) *writeBarrier {
+	return &writeBarrier{
+		target: target,
+		ch:     make(chan struct{}),
+	}
+}
+
+func (b *writeBarrier) arriveAndWait() {
+	if atomic.AddInt32(&b.count, 1) == b.target {
+		b.once.Do(func() { close(b.ch) })
+	}
+	<-b.ch
+}
+
+type barrierFile struct {
+	vfs.File
+	b    *writeBarrier
+	once sync.Once
+}
+
+func (f *barrierFile) waitOnce() {
+	f.once.Do(func() { f.b.arriveAndWait() })
+}
+
+func (fs *writeBarrierFS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, error) {
+	f, err := fs.FS.Create(name, category)
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasSuffix(name, ".sst") {
+		return &barrierFile{File: f, b: fs.b}, nil
+	}
+	return f, nil
+}
+
+func (fs *writeBarrierFS) ReuseForWrite(
+	oldname, newname string, category vfs.DiskWriteCategory,
+) (vfs.File, error) {
+	f, err := fs.FS.ReuseForWrite(oldname, newname, category)
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasSuffix(newname, ".sst") {
+		return &barrierFile{File: f, b: fs.b}, nil
+	}
+	return f, nil
+}
+
+func (f *barrierFile) Write(p []byte) (int, error) {
+	f.waitOnce()
+	return f.File.Write(p)
+}
+
+func (f *barrierFile) WriteAt(p []byte, ofs int64) (int, error) {
+	f.waitOnce()
+	return f.File.WriteAt(p, ofs)
+}
 
 func Test_pmt_basic(t *testing.T) {
 	db := MustDB()
@@ -206,11 +280,14 @@ func Test_pmt_wa(t *testing.T) {
 	//benchmarkRandomRead(datas, db)
 }
 
-// 可能需要用全局变量判断
+// 可能需要用全局变量判断, 目前只用writeBarrierFS
+// 如果写盘不并发，Test_concurrent会卡住
 func Test_concurrent(t *testing.T) {
 	println(fmt.Sprintf("GOMAXPROCS=%d", runtime.GOMAXPROCS(0)))
+	barrier := newWriteBarrier(2)
 	db := MustDB(func(options *Options) *Options {
-		options.FS = vfs.Default
+		// Block on first sstable write to verify concurrent "write to disk".
+		options.FS = &writeBarrierFS{FS: vfs.Default, b: barrier}
 		pagesize := 4 << 10                       // 4KB
 		options.CacheSize = int64(512 * pagesize) //
 		options.DisableAutomaticCompactions = true
