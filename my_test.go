@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"sort"
 	"strings"
 	"sync"
@@ -246,7 +247,7 @@ func Test_pmt_wa(t *testing.T) {
 		//	spList[j].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], int(manifest.NumLevels-1-sp.WriteTo))
 		//}
 		multilevelFlushConcurrent(db, d.Keys, uint64(i), spList, flushConcurrency)
-		pmtinternal.PartIdx = newPartIdxFromSubParts(spList)
+		pmtinternal.PartIdx = newPartIdxFromSubParts(spList) // TODO: 不是通过CompactionEnd/FlushEnd更新PartIdx
 		println(fmt.Sprintf("done %d", i))
 	}
 	println(fmt.Sprintf("写入阶段耗时(ms): %d", time.Since(writeStart).Milliseconds()))
@@ -588,6 +589,75 @@ func Test_multilevelFlush(t *testing.T) {
 	pmtinternal.PartIdx = newPartIdxFromSubParts(spList)
 	println(db.LSMViewURL())
 	use(pmtinternal.PartIdx)
+}
+
+func Test_multilevelFlush_pprof(t *testing.T) {
+	if testing.Short() {
+		t.Skip("pprof test skipped in short mode")
+	}
+
+	origPartIdx := pmtinternal.PartIdx
+	origSstMap := pmtinternal.SstMap
+	pmtinternal.PartIdx = []pmtinternal.Part{
+		{
+			Low:   0,
+			High:  math.MaxUint64,
+			Stack: nil,
+		},
+	}
+	pmtinternal.SstMap = make(map[uint64]pmtinternal.SstInfo, 1024)
+	defer func() {
+		pmtinternal.PartIdx = origPartIdx
+		pmtinternal.SstMap = origSstMap
+	}()
+
+	profPath := "multilevel_flush.cpu.prof"
+	_ = os.Remove(profPath)
+	f, err := os.Create(profPath)
+	if err != nil {
+		t.Fatalf("create pprof file: %v", err)
+	}
+	runtime.SetMutexProfileFraction(1000)
+	if err := pprof.StartCPUProfile(f); err != nil {
+		_ = f.Close()
+		t.Fatalf("start cpu profile: %v", err)
+	}
+	defer func() {
+		pprof.StopCPUProfile()
+		_ = f.Close()
+	}()
+
+	db := MustDB(func(options *Options) *Options {
+		options.FS = vfs.Default
+		pagesize := 4 << 10
+		options.CacheSize = int64(512 * pagesize)
+		options.DisableAutomaticCompactions = true
+		options.MaxConcurrentCompactions = func() int { return 8 }
+		return options
+	})
+	defer db.Close()
+
+	const rounds = 32
+	dir := "pmttestdata"
+	for r := 0; r < rounds; r++ {
+		path := filepath.Join(dir, fmt.Sprintf("normal_plus_round_%03d.bin", r))
+		d := LoadDataFile(path)
+		spList := plan()
+		for i, sp := range spList {
+			mem := fakeMemTable{
+				keys: rangeLimit(d.Keys, sp.low, sp.High),
+				v:    uint64(r),
+			}
+			spList[i].Outputs = multilevelFlushWithResult(
+				db,
+				mem,
+				sp.Stack[sp.WriteTo:],
+				int(manifest.NumLevels-1-sp.WriteTo),
+			)
+		}
+		pmtinternal.PartIdx = newPartIdxFromSubParts(spList)
+	}
+	t.Logf("pprof cpu profile written to %s", profPath)
 }
 
 func MustIngestToLevel(db *DB, dir string, name string, level int) {
