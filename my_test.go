@@ -637,24 +637,14 @@ func Test_multilevelFlush_pprof(t *testing.T) {
 	})
 	defer db.Close()
 
-	const rounds = 32
+	const rounds = 64
+	const flushConcurrency = 4
 	dir := "pmttestdata"
 	for r := 0; r < rounds; r++ {
 		path := filepath.Join(dir, fmt.Sprintf("normal_plus_round_%03d.bin", r))
 		d := LoadDataFile(path)
 		spList := plan()
-		for i, sp := range spList {
-			mem := fakeMemTable{
-				keys: rangeLimit(d.Keys, sp.low, sp.High),
-				v:    uint64(r),
-			}
-			spList[i].Outputs = multilevelFlushWithResult(
-				db,
-				mem,
-				sp.Stack[sp.WriteTo:],
-				int(manifest.NumLevels-1-sp.WriteTo),
-			)
-		}
+		multilevelFlushConcurrent(db, d.Keys, uint64(r), spList, flushConcurrency)
 		pmtinternal.PartIdx = newPartIdxFromSubParts(spList)
 	}
 	t.Logf("pprof cpu profile written to %s", profPath)
