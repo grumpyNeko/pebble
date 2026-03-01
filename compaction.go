@@ -3140,7 +3140,7 @@ func (d *DB) runCompaction(
 	// the current format major version of the DB, but Options may define
 	// additional constraints.
 	tableFormat := d.TableFormat()
-	if pmtinternal.EnablePMT && pmtinternal.EnableNewTableFormat {
+	if pmtinternal.EnablePMT && pmtinternal.EnablePMTTableFormat {
 		tableFormat = sstable.TableFormatPMT0
 	}
 

@@ -28,16 +28,16 @@ columnarblock，把key/trailer/value分列编码，固定长度数据省开销
   列7: prefixChanged[]   (位图)                                                                                                                                                                                                                   
   Padding      
 
-
-- 新增SSTable格式
+# 新增SSTable格式
 TableFormatPMT0
-4KB DataPage + IndexPage + footer
+4KB DataPage + IndexPage
 只支持SET,  key/value都是8字节
 RawWriter适配
-不过把compaction输出切到PMT0的开关目前还是注释状态
-  - pmt_example_test.go（Test_PMT_Format_Basic、Test_PMT_TableFormat）                                                                                                                                                                            
-  - sstable/pmtformat/pmt_test.go（PMT 格式读写的主测试）                                                                                                                                                                                         
-  - my_test.go（有 TableFormatPMT0 使用示例注释）       
+通过EnablePMTTableFormat开关
+没接入Pebble read path: DB.Get -> getIter -> newIters -> sstable.NewReader
+在my.go中实现PMT专门的查找PMTGet(k)
+  PartIdx + SstMap + Stack
+  返回(v, found, tableCt)
 ```
 
 TableFormatPMT0是干嘛的, 是半成品吗, 怎么用?

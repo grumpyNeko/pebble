@@ -747,38 +747,57 @@ func avg(db *DB) {
 }
 
 // Test_PMT_Format_Basic 演示 PMT 格式的基本用法
+/*
+keys <- normal_plus_round_000
+tableBuf <- keys
+check all point read
+check all range read
+*/
 func Test_PMT_Format_Basic(t *testing.T) {
-	var buf bytes.Buffer
-	w := pmtformat.NewWriter(&buf)
+	path := filepath.Join("pmttestdata", "normal_plus_round_000.bin")
+	d := LoadDataFile(path)
+	keys := d.Keys
+	if len(keys) > pmtformat.MaxEntriesPerTable() {
+		keys = keys[:pmtformat.MaxEntriesPerTable()]
+	}
 
-	// 添加数据
-	w.Add(100, 1)
-	w.Add(200, 2)
-	w.Add(300, 3)
-	w.Add(400, 4)
-
+	var tableBuf bytes.Buffer
+	w := pmtformat.NewWriter(&tableBuf)
+	for _, k := range keys {
+		// value=key 便于校验 point/range read
+		if err := w.Add(k, k); err != nil {
+			t.Fatalf("pmt add failed (key=%d): %v", k, err)
+		}
+	}
 	if err := w.Close(); err != nil {
-		t.Fatalf("Failed to close writer: %v", err)
+		t.Fatalf("pmt close failed: %v", err)
 	}
 
-	// 读取
-	data := buf.Bytes()
-	r, err := pmtformat.NewReader(bytes.NewReader(data), int64(len(data)))
+	r, err := pmtformat.NewReader(bytes.NewReader(tableBuf.Bytes()), int64(tableBuf.Len()))
 	if err != nil {
-		t.Fatalf("Failed to create reader: %v", err)
+		t.Fatalf("pmt reader create failed: %v", err)
 	}
 
-	// 验证
-	if len(r.Entries()) != 4 {
-		t.Errorf("Expected 4 entries, got %d", len(r.Entries()))
-	}
-	if len(r.Index()) != 3 {
-		t.Errorf("Expected 3 index keys, got %d", len(r.Index()))
+	// check all point read
+	for _, k := range keys {
+		v, ok := r.Get(k)
+		if !ok || v != k {
+			t.Fatalf("point read failed: key=%d, val=%d, ok=%v", k, v, ok)
+		}
 	}
 
-	// Get 返回最新值
-	if val, ok := r.Get(100); !ok || val != 1 {
-		t.Errorf("Expected Get(100) = 1, got %d, %v", val, ok)
+	// check all range read
+	entries := r.Entries()
+	if len(entries) != len(keys) {
+		t.Fatalf("entries len mismatch: expected %d, got %d", len(keys), len(entries))
+	}
+	for i := range entries {
+		if entries[i].UserKey != keys[i] {
+			t.Fatalf("range read key mismatch at %d: expected %d, got %d", i, keys[i], entries[i].UserKey)
+		}
+		if entries[i].Value != keys[i] {
+			t.Fatalf("range read value mismatch at %d: expected %d, got %d", i, keys[i], entries[i].Value)
+		}
 	}
 }
 
@@ -786,11 +805,15 @@ func Test_PMT_Format_Basic(t *testing.T) {
 func Test_PMT_Format_Performance(t *testing.T) {
 	path := filepath.Join("pmttestdata", "normal_plus_round_000.bin")
 	d := LoadDataFile(path)
+	keys := d.Keys
+	if len(keys) > pmtformat.MaxEntriesPerTable() {
+		keys = keys[:pmtformat.MaxEntriesPerTable()]
+	}
 
 	// Build PMT0 format in-memory.
 	var pmtBuf bytes.Buffer
 	pmtWriter := pmtformat.NewWriter(&pmtBuf)
-	for _, k := range d.Keys {
+	for _, k := range keys {
 		if err := pmtWriter.Add(k, 1); err != nil {
 			t.Fatalf("pmt add failed (key=%d): %v", k, err)
 		}
@@ -816,8 +839,9 @@ func Test_PMT_Format_Performance(t *testing.T) {
 	})
 	var keyBuf [8]byte
 	var valBuf [8]byte
-	binary.BigEndian.PutUint64(valBuf[:], 1)
-	for _, k := range d.Keys {
+
+	for _, k := range keys {
+		binary.BigEndian.PutUint64(valBuf[:], rand.Uint64())
 		binary.BigEndian.PutUint64(keyBuf[:], k)
 		if err := oldWriter.Set(keyBuf[:], valBuf[:]); err != nil {
 			t.Fatalf("old format set failed (key=%d): %v", k, err)
@@ -834,7 +858,7 @@ func Test_PMT_Format_Performance(t *testing.T) {
 
 	ratio := float64(pmtSize) / float64(oldSize)
 	t.Logf("dataset: %s", path)
-	t.Logf("keys: %d", len(d.Keys))
+	t.Logf("keys: %d", len(keys))
 	t.Logf("pmtformat size: %d bytes", pmtSize)
 	t.Logf("oldformat(v1, no compression) size: %d bytes", oldSize)
 	t.Logf("size ratio (pmt/old): %.4f", ratio)
