@@ -35,10 +35,17 @@ TableFormatPMT0
 RawWriter适配
 通过EnablePMTTableFormat开关
 没接入Pebble read path: DB.Get -> getIter -> newIters -> sstable.NewReader
+
+Options增加字段FileFormat
+在DB.TableFormat()中优先使用opts.FileFormat, 原先取FormatMajorVersion再按实验开关降级
+
 在my.go中实现PMT专门的查找PMTGet(k)
   PartIdx + SstMap + Stack
   返回(v, found, tableCt)
 ```
 
-TableFormatPMT0是干嘛的, 是半成品吗, 怎么用?
-简要回答
+
+# 改动
+
+
+

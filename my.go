@@ -163,7 +163,10 @@ func pmtOptions() *Options {
 
 func EnablePebble(opts *Options) *Options {
 	pmtinternal.EnablePMT = false
+	pmtinternal.EnablePMTTableFormat = false
+
 	opts.DisableAutomaticCompactions = false
+	opts.FileFormat = sstable.TableFormatLevelDB
 	opts.Experimental.MultiLevelCompactionHeuristic = NoMultiLevel{}
 	return opts
 }

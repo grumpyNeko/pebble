@@ -237,6 +237,7 @@ func Test_MyGet(t *testing.T) {
 // 128, 7.72, avg:3.84
 func Test_pebble_wa(t *testing.T) {
 	db := MustDB(EnablePebble, func(options *Options) *Options {
+		options.FS = vfs.Default
 		options.DisableAutomaticCompactions = false
 		return options
 	})

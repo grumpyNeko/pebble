@@ -806,6 +806,11 @@ type Options struct {
 	// ratchet the database to the specified format major version.
 	FormatMajorVersion FormatMajorVersion
 
+	// FileFormat overrides the sstable format used when writing new files.
+	// If left unspecified, the format is derived from FormatMajorVersion and
+	// related experimental options.
+	FileFormat sstable.TableFormat
+
 	// FS provides the interface for persistent file storage.
 	//
 	// The default value uses the underlying operating system's file system.

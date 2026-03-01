@@ -362,6 +362,10 @@ func (d *DB) FormatMajorVersion() FormatMajorVersion {
 // major version, as well as experimental settings like EnableValueBlocks and
 // EnableColumnarBlocks.
 func (d *DB) TableFormat() sstable.TableFormat {
+	if d.opts.FileFormat != sstable.TableFormatUnspecified {
+		return d.opts.FileFormat
+	}
+
 	// The table is typically written at the maximum allowable format implied by
 	// the current format major version of the DB.
 	f := d.FormatMajorVersion().MaxTableFormat()
