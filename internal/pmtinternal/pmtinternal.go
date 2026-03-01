@@ -17,8 +17,6 @@ var PartIdx []Part = []Part{
 	},
 }
 
-var NewPartIdx []Part = []Part{} // TODO
-
 // todo: First,Last
 type Part struct {
 	Low   uint64 // inclusive lower bound (minimum key that can be contained)

@@ -3142,6 +3142,13 @@ func (d *DB) runCompaction(
 	tableFormat := d.TableFormat()
 	if pmtinternal.EnablePMT && pmtinternal.EnablePMTTableFormat {
 		tableFormat = sstable.TableFormatPMT0
+		const requiredPMTTargetSize uint64 = 2 << 20
+		if c.maxOutputFileSize != requiredPMTTargetSize {
+			panic(fmt.Sprintf(
+				"PMT0 requires TargetOutputFileSize=%d, got=%d",
+				requiredPMTTargetSize, c.maxOutputFileSize,
+			))
+		}
 	}
 
 	// Release the d.mu lock while doing I/O.

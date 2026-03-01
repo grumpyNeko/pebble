@@ -1,6 +1,7 @@
 package pebble
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/pmtformat"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/samber/lo"
 	"math"
@@ -48,7 +50,7 @@ func assertEmptyMemtable(db *DB) {
 	}
 }
 
-// TODO: 不应该有重复的key, 应该有相同的sn
+// 这是早期用来研究的, 现在pmt不应该调用这个
 func batchWrite(db *DB, keys []uint64, v uint64) {
 	//db.mu.Lock()
 	//defer db.mu.Unlock()
@@ -145,7 +147,7 @@ func pmtOptions() *Options {
 		   要求L0只有一个文件, 有点蠢
 	*/
 	opts.L0CompactionThreshold = 3
-
+	opts.MaxConcurrentCompactions = func() int { return 8 }
 	const pagesize = 4096
 	opts.CacheSize = 256 * pagesize
 	opts.Levels = make([]LevelOptions, 7)
@@ -428,6 +430,116 @@ func (d *DB) MustGet(key []byte) ([]byte, int) {
 		panic("why not found")
 	}
 	return i.Value(), get.filesAccessed
+}
+
+// PMTGet performs a PMT-specific lookup path:
+// PartIdx -> Stack (newest to oldest) -> candidate tables.
+// It returns (value, found, tableCt), where tableCt is the number of tables probed.
+func (d *DB) PMTGet(k uint64) (v uint64, found bool, tableCt int) {
+	if err := d.closed.Load(); err != nil {
+		panic(err)
+	}
+	part, ok := pmtPartForKey(k)
+	if !ok || len(part.Stack) == 0 {
+		panic("why")
+	}
+	// Copy stack to avoid races with concurrent PartIdx updates.
+	stack := append([]base.FileNum(nil), part.Stack...)
+
+	readState := d.loadReadState()
+	defer readState.unref()
+
+	// Build a fileNum -> tableMetadata map for files in this partition stack.
+	wanted := make(map[base.FileNum]struct{}, len(stack))
+	for _, fn := range stack {
+		wanted[fn] = struct{}{}
+	}
+	metaByFile := make(map[base.FileNum]*tableMetadata, len(wanted))
+	for level := 0; level < numLevels && len(metaByFile) < len(wanted); level++ {
+		iter := readState.current.Levels[level].Iter()
+		for f := iter.First(); f != nil; f = iter.Next() {
+			if _, ok := wanted[f.FileNum]; ok {
+				metaByFile[f.FileNum] = f
+			}
+		}
+	}
+
+	// Newest files are appended to stack tail; probe tail -> head.
+	for i := len(stack) - 1; i >= 0; i-- {
+		fn := stack[i]
+		info, ok := pmtinternal.SstMap[uint64(fn)]
+		if !ok {
+			continue
+		}
+		if k < info.Smallest || k > info.Largest {
+			continue
+		}
+		meta, ok := metaByFile[fn]
+		if !ok {
+			continue
+		}
+		tableCt++
+		if val, ok := d.pmtGetFromFile(meta.FileNum, k); ok {
+			return val, true, tableCt
+		}
+	}
+	return 0, false, tableCt
+}
+
+func pmtPartForKey(k uint64) (pmtinternal.Part, bool) {
+	parts := pmtinternal.PartIdx
+	if len(parts) == 0 {
+		return pmtinternal.Part{}, false
+	}
+	low, high := 0, len(parts)
+	for low < high {
+		mid := int(uint(low+high) >> 1)
+		if parts[mid].High < k {
+			low = mid + 1
+		} else {
+			high = mid
+		}
+	}
+	if low >= len(parts) {
+		return pmtinternal.Part{}, false
+	}
+	p := parts[low]
+	if p.Low <= k && k <= p.High {
+		return p, true
+	}
+	return pmtinternal.Part{}, false
+}
+
+func (d *DB) pmtGetFromFile(fileNum base.FileNum, k uint64) (uint64, bool) {
+	f, err := d.objProvider.OpenForReading(
+		context.Background(),
+		base.FileTypeTable,
+		base.DiskFileNum(fileNum),
+		objstorage.OpenOptions{MustExist: true},
+	)
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			panic(err)
+		}
+	}()
+
+	size := f.Size()
+	if size <= 0 {
+		return 0, false
+	}
+
+	buf := make([]byte, size)
+	if err := f.ReadAt(context.Background(), buf, 0); err != nil {
+		panic(err)
+	}
+	r, err := pmtformat.NewReader(bytes.NewReader(buf), size)
+	if err != nil {
+		panic(fmt.Sprintf("PMTGet open PMT reader failed for file %d: %v", fileNum, err))
+	}
+	return r.Get(k)
 }
 
 func printKeys(db *DB) {

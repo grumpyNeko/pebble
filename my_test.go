@@ -97,18 +97,73 @@ func (f *barrierFile) WriteAt(p []byte, ofs int64) (int, error) {
 	return f.File.WriteAt(p, ofs)
 }
 
+/*
+老代码暂时保留
+batchWrite(db, []uint64{2, 10}, 0)
+batchWrite(db, []uint64{15, 99}, 0)
+batchWrite(db, []uint64{1, 20}, 0)
+println(db.LSMViewURL())
+db.manualCompact(BigEndian(2), BigEndian(10), 0, false)
+println(db.LSMViewURL())
+*/
 func Test_pmt_basic(t *testing.T) {
-	db := MustDB()
-	batchWrite(db, []uint64{2, 10}, 0)
-	batchWrite(db, []uint64{15, 99}, 0)
-	batchWrite(db, []uint64{1, 20}, 0)
-	println(db.LSMViewURL())
-	db.manualCompact(BigEndian(2), BigEndian(10), 0, false)
-	println(db.LSMViewURL())
+	db := MustDB(func(options *Options) *Options {
+		return options
+	})
+	origPartIdx := pmtinternal.PartIdx
+	origSstMap := pmtinternal.SstMap
+	defer func() {
+		pmtinternal.PartIdx = origPartIdx
+		pmtinternal.SstMap = origSstMap
+	}()
+	pmtinternal.PartIdx = []pmtinternal.Part{
+		{
+			Low:   0,
+			High:  math.MaxUint64,
+			Stack: nil,
+		},
+	}
+	pmtinternal.SstMap = make(map[uint64]pmtinternal.SstInfo, 1024)
+
+	path := filepath.Join("pmttestdata", "normal_plus_round_000.bin")
+	d := LoadDataFile(path)
+	keys := d.Keys
+
+	spList := plan()
+	// 一个Table最多131072个KV, 超出就生成多个Table, 不应该报错的, 问题出在哪
+	multilevelFlushConcurrent(db, keys, uint64(0), spList, 2)
+	pmtinternal.PartIdx = newPartIdxFromSubParts(spList)
+
 	metrics := db.Metrics()
-	println(fmt.Sprintf("%+v", metrics))
+	if len(pmtinternal.PartIdx) == 0 {
+		t.Fatalf("PartIdx is empty after multilevel flush")
+	}
 	use(metrics)
 	use(pmtinternal.PartIdx)
+}
+
+func Test_PMTGet(t *testing.T) {
+	db := MustDB()
+	// Two flushes for the same key. PMTGet should probe stack from newest to oldest.
+	batchWrite(db, []uint64{2}, 1)
+	batchWrite(db, []uint64{2}, 9)
+
+	v, found, tableCt := db.PMTGet(2)
+	if !found {
+		t.Fatalf("PMTGet(2) not found")
+	}
+	if v != 9 {
+		t.Fatalf("PMTGet(2) expected 9, got %d", v)
+	}
+	if tableCt < 1 {
+		t.Fatalf("PMTGet(2) expected tableCt >= 1, got %d", tableCt)
+	}
+
+	v, found, tableCt = db.PMTGet(999)
+	if found {
+		t.Fatalf("PMTGet(999) expected not found, got value=%d", v)
+	}
+	use(tableCt)
 }
 
 func Test_split(t *testing.T) {
