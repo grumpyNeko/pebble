@@ -241,7 +241,7 @@ func Test_pebble_wa(t *testing.T) {
 		return options
 	})
 
-	times := 32 // 48
+	times := 64 // 48
 	deviation := uint64(1 << 30)
 	for i := 0; i < times; i++ {
 		d := NewData()
@@ -287,16 +287,17 @@ func Test_pmt_wa(t *testing.T) {
 		return options
 	})
 
-	const flushConcurrency = 4
-	times := 128 // 48
+	const flushConcurrency = 1
+	times := 64 // 128
 	datas := []uint64{}
-	writeStart := time.Now()
-	dir := "pmttestdata"
 	for i := 0; i < times; i++ {
-		path := filepath.Join(dir, fmt.Sprintf("normal_plus_round_%03d.bin", i))
+		path := filepath.Join("pmttestdata", fmt.Sprintf("normal_plus_round_%03d.bin", i))
 		d := LoadDataFile(path)
 		datas = append(datas, d.Keys...)
-
+	}
+	writeStart := time.Now()
+	for i := 0; i < times; i++ {
+		keys := datas[i<<20 : (i+1)<<20]
 		spList := plan()
 		//for j, sp := range spList {
 		//	mem := fakeMemTable{
@@ -305,7 +306,7 @@ func Test_pmt_wa(t *testing.T) {
 		//	}
 		//	spList[j].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], int(manifest.NumLevels-1-sp.WriteTo))
 		//}
-		multilevelFlushConcurrent(db, d.Keys, uint64(i), spList, flushConcurrency)
+		multilevelFlushConcurrent(db, keys, uint64(i), spList, flushConcurrency)
 		pmtinternal.PartIdx = newPartIdxFromSubParts(spList) // TODO: 不是通过CompactionEnd/FlushEnd更新PartIdx
 		println(fmt.Sprintf("done %d", i))
 	}

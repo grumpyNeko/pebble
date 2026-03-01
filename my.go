@@ -343,6 +343,11 @@ func MustFind(list []base.FileNum, target uint64) int {
 type OptionPatch func(options *Options) *Options
 
 func MustDB(list ...OptionPatch) *DB {
+	if pmtinternal.EnablePMT {
+		if !pmtinternal.EnablePMTTableFormat {
+			println("EnablePMT but not EnablePMTTableFormat????????????????????????????")
+		}
+	}
 	opts := pmtOptions()
 	for _, e := range list {
 		opts = e(opts)

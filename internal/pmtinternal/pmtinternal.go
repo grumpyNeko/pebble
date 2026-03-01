@@ -7,7 +7,7 @@ import (
 )
 
 var EnablePMT = true
-var EnablePMTTableFormat = true
+var EnablePMTTableFormat = false
 
 var PartIdx []Part = []Part{
 	Part{
