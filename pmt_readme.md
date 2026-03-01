@@ -16,9 +16,29 @@ pmt是在pebble基础上的增强, 大量使用goto跳过一部分原有逻辑
 注释掉db.flush中的maybeScheduleCompaction
 修改compaction迭代器, 增加memtable
 
+# TableFormatPebblev6比v1小   
+columnarblock，把key/trailer/value分列编码，固定长度数据省开销
+  Header                                                                                                                                                                                                                                          
+  列1: key_prefix[]      (一列全是前缀)                                                                                                                                                                                                           
+  列2: key_suffix[]      (一列全是后缀)                                                                                                                                                                                                           
+  列3: trailer[]         (seqnum+kind)                                                                                                                                                                                                            
+  列4: value[]                                                                                                                                                                                                                                    
+  列5: isValueExternal[] (位图)                                                                                                                                                                                                                   
+  列6: isObsolete[]      (位图)                                                                                                                                                                                                                   
+  列7: prefixChanged[]   (位图)                                                                                                                                                                                                                   
+  Padding      
+
+
 - 新增SSTable格式
 TableFormatPMT0
-4KB DataPage + IndexPage+ footer
+4KB DataPage + IndexPage + footer
+只支持SET,  key/value都是8字节
 RawWriter适配
 不过把compaction输出切到PMT0的开关目前还是注释状态
+  - pmt_example_test.go（Test_PMT_Format_Basic、Test_PMT_TableFormat）                                                                                                                                                                            
+  - sstable/pmtformat/pmt_test.go（PMT 格式读写的主测试）                                                                                                                                                                                         
+  - my_test.go（有 TableFormatPMT0 使用示例注释）       
 ```
+
+TableFormatPMT0是干嘛的, 是半成品吗, 怎么用?
+简要回答

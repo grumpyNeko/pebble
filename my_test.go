@@ -1,11 +1,15 @@
 package pebble
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/pmtinternal"
+	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
+	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/pmtformat"
 	"github.com/cockroachdb/pebble/vfs"
 	"math"
 	"math/rand"
@@ -742,7 +746,96 @@ func avg(db *DB) {
 	println(fmt.Sprintf("ct:%d, avg:%f", ct, float64(sum)/float64(ct)))
 }
 
-// 演示如何使用 TableFormatPMT0
-func Test_PMT_Format(t *testing.T) {
-	// ...
+// Test_PMT_Format_Basic 演示 PMT 格式的基本用法
+func Test_PMT_Format_Basic(t *testing.T) {
+	var buf bytes.Buffer
+	w := pmtformat.NewWriter(&buf)
+
+	// 添加数据
+	w.Add(100, 1)
+	w.Add(200, 2)
+	w.Add(300, 3)
+	w.Add(400, 4)
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("Failed to close writer: %v", err)
+	}
+
+	// 读取
+	data := buf.Bytes()
+	r, err := pmtformat.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("Failed to create reader: %v", err)
+	}
+
+	// 验证
+	if len(r.Entries()) != 4 {
+		t.Errorf("Expected 4 entries, got %d", len(r.Entries()))
+	}
+	if len(r.Index()) != 3 {
+		t.Errorf("Expected 3 index keys, got %d", len(r.Index()))
+	}
+
+	// Get 返回最新值
+	if val, ok := r.Get(100); !ok || val != 1 {
+		t.Errorf("Expected Get(100) = 1, got %d, %v", val, ok)
+	}
+}
+
+// 测试PMT格式的性能
+func Test_PMT_Format_Performance(t *testing.T) {
+	path := filepath.Join("pmttestdata", "normal_plus_round_000.bin")
+	d := LoadDataFile(path)
+
+	// Build PMT0 format in-memory.
+	var pmtBuf bytes.Buffer
+	pmtWriter := pmtformat.NewWriter(&pmtBuf)
+	for _, k := range d.Keys {
+		if err := pmtWriter.Add(k, 1); err != nil {
+			t.Fatalf("pmt add failed (key=%d): %v", k, err)
+		}
+	}
+	if err := pmtWriter.Close(); err != nil {
+		t.Fatalf("pmt close failed: %v", err)
+	}
+	pmtSize := pmtBuf.Len()
+
+	// Build old format on an in-memory FS.
+	mem := vfs.NewMem()
+	const oldName = "old_format.sst"
+	oldFile, err := mem.Create(oldName, vfs.WriteCategoryUnspecified)
+	if err != nil {
+		t.Fatalf("create old format file failed: %v", err)
+	}
+	oldWriter := sstable.NewWriter(objstorageprovider.NewFileWritable(oldFile), sstable.WriterOptions{
+		TableFormat: sstable.TableFormatPebblev1,
+		Compression: NoCompression,
+		BlockSize:   4096,
+		//FilterPolicy: bloom.FilterPolicy(10), // 10 bits used per key
+		//FilterType:   TableFilter,
+	})
+	var keyBuf [8]byte
+	var valBuf [8]byte
+	binary.BigEndian.PutUint64(valBuf[:], 1)
+	for _, k := range d.Keys {
+		binary.BigEndian.PutUint64(keyBuf[:], k)
+		if err := oldWriter.Set(keyBuf[:], valBuf[:]); err != nil {
+			t.Fatalf("old format set failed (key=%d): %v", k, err)
+		}
+	}
+	if err := oldWriter.Close(); err != nil {
+		t.Fatalf("old format close failed: %v", err)
+	}
+	fi, err := mem.Stat(oldName)
+	if err != nil {
+		t.Fatalf("stat old format file failed: %v", err)
+	}
+	oldSize := fi.Size()
+
+	ratio := float64(pmtSize) / float64(oldSize)
+	t.Logf("dataset: %s", path)
+	t.Logf("keys: %d", len(d.Keys))
+	t.Logf("pmtformat size: %d bytes", pmtSize)
+	t.Logf("oldformat(v1, no compression) size: %d bytes", oldSize)
+	t.Logf("size ratio (pmt/old): %.4f", ratio)
 }

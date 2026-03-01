@@ -3140,9 +3140,9 @@ func (d *DB) runCompaction(
 	// the current format major version of the DB, but Options may define
 	// additional constraints.
 	tableFormat := d.TableFormat()
-	//if pmtinternal.EnablePMT {
-	//	tableFormat = sstable.TableFormatPMT0
-	//}
+	if pmtinternal.EnablePMT && pmtinternal.EnableNewTableFormat {
+		tableFormat = sstable.TableFormatPMT0
+	}
 
 	// Release the d.mu lock while doing I/O.
 	// Note the unusual order: Unlock and then Lock.
