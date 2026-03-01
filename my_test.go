@@ -234,37 +234,51 @@ func Test_MyGet(t *testing.T) {
 // 32, 5.5, avg=3.624498
 // 64, 6.6, avg:3.756997
 // 96, 7.44, avg:3.801390
-// 128, 7.72, avg:3.84
+// 128, 7.72, avg:3.84,
+
+// normal_plus
+// 64, 耗时: 91759+77551=169310=>396.37 Kops
+// 128, 耗时: 346264+100101=446365=>300.69 Kops
 func Test_pebble_wa(t *testing.T) {
 	db := MustDB(EnablePebble, func(options *Options) *Options {
 		options.FS = vfs.Default
 		options.DisableAutomaticCompactions = false
+
+		options.FileFormat = sstable.TableFormatLevelDB
+		pagesize := 4 << 10 // 4KB
+		options.CacheSize = int64(512 * pagesize)
+		options.MaxConcurrentCompactions = func() int { return 8 }
 		return options
 	})
 
-	times := 64 // 48
-	deviation := uint64(1 << 30)
+	times := 128 // 48
+	datas := []uint64{}
 	for i := 0; i < times; i++ {
-		d := NewData()
-		mean := 1024*math.MaxUint32 + uint64(i)*(math.MaxUint32)
-		use(mean, deviation)
-		d = d.AddNormal(mean, deviation, 1<<20, MinKey+1, MaxKey-1)
-		d = d.AddUniform(MinKey+1, MaxKey-1, 1024)
-		d = d.AddMinMax()
-		//d = d.AddUniform(MinKey, MaxKey, 1<<20)
-		sort.Slice(d.Keys, func(i, j int) bool { return d.Keys[i] < d.Keys[j] })
-		batchWrite(db, d.Keys, uint64(i))
-		println(fmt.Sprintf("done %d", i))
-	}
-	for isCompacting(db) {
-		println("wait for compact")
-		time.Sleep(10 * time.Second)
+		path := filepath.Join("pmttestdata", fmt.Sprintf("normal_plus_round_%03d.bin", i))
+		d := LoadDataFile(path)
+		datas = append(datas, d.Keys...)
 	}
 
-	metrics := stat(db)
-	use(metrics)
-	use(pmtinternal.PartIdx)
-	println(metrics.Total().BytesIn)
+	writeStart := time.Now()
+	for i := 0; i < times; i++ {
+		keys := datas[i<<20 : (i+1)<<20]
+		batchWrite(db, keys, uint64(i))
+		println(fmt.Sprintf("done %d", i))
+	}
+	println(fmt.Sprintf("写入阶段耗时(ms): %d", time.Since(writeStart).Milliseconds()))
+
+	compactWaitStart := time.Now()
+	for isCompacting(db) {
+		println("wait for compact")
+		time.Sleep(500 * time.Millisecond)
+	}
+	println(fmt.Sprintf("等待压实耗时(ms): %d", time.Since(compactWaitStart).Milliseconds()))
+
+	//metrics := stat(db)
+	//use(metrics)
+	//use(pmtinternal.PartIdx)
+	//println(metrics.Total().BytesIn)
+
 	//avg(db)
 
 	//println("-------------------------------")
@@ -277,6 +291,9 @@ func Test_pebble_wa(t *testing.T) {
 	//time.Sleep(1000)
 }
 
+// normal_plus
+// 64, 耗时: 113773=>589.85 Kops
+// 128, 耗时: 195638=>686.05 Kops
 func Test_pmt_wa(t *testing.T) {
 	println(fmt.Sprintf("GOMAXPROCS=%d", runtime.GOMAXPROCS(0)))
 	db := MustDB(func(options *Options) *Options {
@@ -289,7 +306,7 @@ func Test_pmt_wa(t *testing.T) {
 	})
 
 	const flushConcurrency = 1
-	times := 64 // 128
+	times := 128 // 128
 	datas := []uint64{}
 	for i := 0; i < times; i++ {
 		path := filepath.Join("pmttestdata", fmt.Sprintf("normal_plus_round_%03d.bin", i))
@@ -313,10 +330,10 @@ func Test_pmt_wa(t *testing.T) {
 	}
 	println(fmt.Sprintf("写入阶段耗时(ms): %d", time.Since(writeStart).Milliseconds()))
 
-	metrics := stat(db)
-	use(metrics)
-	use(pmtinternal.PartIdx)
-	println(metrics.Total().BytesIn)
+	//metrics := stat(db)
+	//use(metrics)
+	//use(pmtinternal.PartIdx)
+	//println(metrics.Total().BytesIn)
 
 	// ------------------------------
 

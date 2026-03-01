@@ -346,24 +346,26 @@ func MustFind(list []base.FileNum, target uint64) int {
 type OptionPatch func(options *Options) *Options
 
 func MustDB(list ...OptionPatch) *DB {
+	opts := pmtOptions()
+	for _, e := range list {
+		opts = e(opts)
+	}
+	const path = "test-db"
+	// 删除所有数据
+	if err := os.RemoveAll(path); err != nil {
+		panic(err)
+	}
+	db, err := Open(path, opts)
+	if err != nil {
+		panic(err)
+	}
+	db.largeBatchThreshold = 1 // TODO: 这个竟然是没法配置的...
+
 	if pmtinternal.EnablePMT {
 		if !pmtinternal.EnablePMTTableFormat {
 			println("EnablePMT but not EnablePMTTableFormat????????????????????????????")
 		}
 	}
-	opts := pmtOptions()
-	for _, e := range list {
-		opts = e(opts)
-	}
-	// 删除test-db下所有数据
-	if err := os.RemoveAll("test-db"); err != nil {
-		panic(err)
-	}
-	db, err := Open("test-db", opts)
-	if err != nil {
-		panic(err)
-	}
-	db.largeBatchThreshold = 1 // TODO: 这个竟然是没法配置的...
 	return db
 }
 
