@@ -238,7 +238,7 @@ func Test_MyGet(t *testing.T) {
 
 // normal_plus
 // 64, 耗时: 91759+77551=169310=>396.37 Kops
-// 128, 耗时: 346264+100101=446365=>300.69 Kops
+// 128, 耗时: 346264+100101=446365=>300.69 Kops; 点读耗时={512page, 101198ms}
 func Test_pebble_wa(t *testing.T) {
 	db := MustDB(EnablePebble, func(options *Options) *Options {
 		options.FS = vfs.Default
@@ -252,7 +252,7 @@ func Test_pebble_wa(t *testing.T) {
 	})
 
 	times := 128 // 48
-	datas := []uint64{}
+	datas := make([]uint64, 0, times<<20)
 	for i := 0; i < times; i++ {
 		path := filepath.Join("pmttestdata", fmt.Sprintf("normal_plus_round_%03d.bin", i))
 		d := LoadDataFile(path)
@@ -280,20 +280,14 @@ func Test_pebble_wa(t *testing.T) {
 	//println(metrics.Total().BytesIn)
 
 	//avg(db)
-
-	//println("-------------------------------")
-	//printNextFileNum(db)
-	//err := db.Compact(BigEndian(0), BigEndian(4391513256358), false)
-	//if err != nil {
-	//	panic(err)
-	//}
-	//printNextFileNum(db)
-	//time.Sleep(1000)
+	benchmarkRandomReadWithCPUProfile(t, datas, db, "pebble_wa_random_read.cpu.prof")
 }
 
 // normal_plus
-// 64, 耗时: 113773=>589.85 Kops
-// 128, 耗时: 195638=>686.05 Kops
+// 64, 写耗时: 84448,81142,97571=>687.79 Kops; 点读耗时=
+// 128, 写耗时: 195638,269629,312484,276104,225041=>596.42 Kops; 点读耗时={512page, 522201ms}
+
+// normal_plus, 128,
 func Test_pmt_wa(t *testing.T) {
 	println(fmt.Sprintf("GOMAXPROCS=%d", runtime.GOMAXPROCS(0)))
 	db := MustDB(func(options *Options) *Options {
@@ -305,9 +299,9 @@ func Test_pmt_wa(t *testing.T) {
 		return options
 	})
 
-	const flushConcurrency = 1
+	const flushConcurrency = 4
 	times := 128 // 128
-	datas := []uint64{}
+	datas := make([]uint64, 0, times<<20)
 	for i := 0; i < times; i++ {
 		path := filepath.Join("pmttestdata", fmt.Sprintf("normal_plus_round_%03d.bin", i))
 		d := LoadDataFile(path)
@@ -356,7 +350,7 @@ func Test_pmt_wa(t *testing.T) {
 	// pmt 256pagescache nocompression 64round, 0.037516
 
 	// pmt 256pagescache nocompression 128round, 47.1us
-	//benchmarkRandomRead(datas, db)
+	benchmarkRandomRead(datas, db)
 }
 
 // 可能需要用全局变量判断, 目前只用writeBarrierFS
@@ -413,15 +407,65 @@ func benchmarkRandomRead(datas []uint64, db *DB) {
 	rand.Shuffle(len(datas), func(i, j int) {
 		datas[i], datas[j] = datas[j], datas[i]
 	})
-	println("start benchmark")
+	println("start random read benchmark")
 	start := time.Now()
 	for i := 0; i < 1<<20; i++ {
-		_, _, err := db.Get(BigEndian(datas[i]))
-		if err != nil {
-			println(err.Error())
-		}
+		db.MustGet(BigEndian(datas[i]))
 	}
-	println(time.Now().Sub(start).Milliseconds())
+	println(fmt.Sprintf("random read cost %dms", time.Since(start).Milliseconds()))
+}
+
+func benchmarkRandomReadMultiThread(datas []uint64, db *DB, concurrency int) {
+	if concurrency < 1 {
+		panic("concurrency < 1")
+	}
+	readN := 1 << 20
+	rand.Shuffle(len(datas), func(i, j int) {
+		datas[i], datas[j] = datas[j], datas[i]
+	})
+	println(fmt.Sprintf("start random read benchmark, concurrency=%d", concurrency))
+	start := time.Now()
+	var wg sync.WaitGroup
+	chunk := (readN + concurrency - 1) / concurrency
+	for g := 0; g < concurrency; g++ {
+		begin := g * chunk
+		end := begin + chunk
+		if end > readN {
+			end = readN
+		}
+		if begin >= end {
+			continue
+		}
+		keys := datas[begin:end]
+		wg.Add(1)
+		go func(keys []uint64) {
+			defer wg.Done()
+			for _, k := range keys {
+				db.MustGet(BigEndian(k))
+			}
+		}(keys)
+	}
+	wg.Wait()
+	println(fmt.Sprintf("random read cost %dms", time.Since(start).Milliseconds()))
+}
+
+func benchmarkRandomReadWithCPUProfile(t *testing.T, datas []uint64, db *DB, profPath string) {
+	t.Helper()
+	_ = os.Remove(profPath)
+	f, err := os.Create(profPath)
+	if err != nil {
+		t.Fatalf("create pprof file: %v", err)
+	}
+	if err := pprof.StartCPUProfile(f); err != nil {
+		_ = f.Close()
+		t.Fatalf("start cpu profile: %v", err)
+	}
+	defer func() {
+		pprof.StopCPUProfile()
+		_ = f.Close()
+	}()
+	benchmarkRandomRead(datas, db)
+	t.Logf("pprof cpu profile written to %s", profPath)
 }
 
 func Test_gen_data(t *testing.T) {

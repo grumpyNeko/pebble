@@ -372,7 +372,7 @@ func MustDB(list ...OptionPatch) *DB {
 // like getInternal
 // panic if not found
 // return filesAccessed
-func (d *DB) MustGet(key []byte) ([]byte, int) {
+func (d *DB) MustGet(key []byte) (val []byte, filesAccessed int) {
 	if err := d.closed.Load(); err != nil {
 		panic(err)
 	}
