@@ -107,7 +107,7 @@ db.manualCompact(BigEndian(2), BigEndian(10), 0, false)
 println(db.LSMViewURL())
 */
 func Test_pmt_basic(t *testing.T) {
-	db := MustDB(func(options *Options) *Options {
+	db := MustDB("test-db", true, func(options *Options) *Options {
 		return options
 	})
 	origPartIdx := pmtinternal.PartIdx
@@ -143,7 +143,7 @@ func Test_pmt_basic(t *testing.T) {
 }
 
 func Test_PMTGet(t *testing.T) {
-	db := MustDB()
+	db := MustDB("test-db", true)
 	// Two flushes for the same key. PMTGet should probe stack from newest to oldest.
 	batchWrite(db, []uint64{2}, 1)
 	batchWrite(db, []uint64{2}, 9)
@@ -168,7 +168,7 @@ func Test_PMTGet(t *testing.T) {
 
 func Test_split(t *testing.T) {
 	//db := PMT()
-	db := MustDB()
+	db := MustDB("test-db", true)
 
 	var metrics *Metrics
 	// 手动增加划分点100
@@ -179,7 +179,7 @@ func Test_split(t *testing.T) {
 }
 
 func Test_sst_meta(t *testing.T) {
-	db := MustDB()
+	db := MustDB("test-db", true)
 	batchWrite(db, []uint64{1, 20}, 0)
 	batchWrite(db, []uint64{1, 20}, 0)
 	batchWrite(db, []uint64{1, 20}, 0)
@@ -201,7 +201,7 @@ func Test_sst_meta(t *testing.T) {
 }
 
 func Test_MyGet(t *testing.T) {
-	db := MustDB(EnablePebble, func(options *Options) *Options {
+	db := MustDB("test-db", true, EnablePebble, func(options *Options) *Options {
 		options.DisableAutomaticCompactions = true
 		return options
 	})
@@ -240,13 +240,13 @@ func Test_MyGet(t *testing.T) {
 // 64, 耗时: 91759+77551=169310=>396.37 Kops
 // 128, 耗时: 346264+100101=446365=>300.69 Kops; 点读耗时={512page, 101198ms}
 func Test_pebble_wa(t *testing.T) {
-	db := MustDB(EnablePebble, func(options *Options) *Options {
+	db := MustDB("test-db", true, EnablePebble, func(options *Options) *Options {
 		options.FS = vfs.Default
 		options.DisableAutomaticCompactions = false
 
 		options.FileFormat = sstable.TableFormatLevelDB
-		pagesize := 4 << 10 // 4KB
-		options.CacheSize = int64(512 * pagesize)
+		pagesize := 4 << 10                        // 4KB
+		options.CacheSize = int64(4096 * pagesize) // 4096=>16MB
 		options.MaxConcurrentCompactions = func() int { return 8 }
 		return options
 	})
@@ -280,7 +280,109 @@ func Test_pebble_wa(t *testing.T) {
 	//println(metrics.Total().BytesIn)
 
 	//avg(db)
-	benchmarkRandomReadWithCPUProfile(t, datas, db, "pebble_wa_random_read.cpu.prof")
+	benchmarkRandomReadMultiThread(datas, db, 1)
+	benchmarkRandomReadMultiThread(datas, db, 4)
+	benchmarkRandomReadMultiThread(datas, db, 8)
+	benchmarkRandomReadMultiThread(datas, db, 12)
+	benchmarkRandomReadMultiThread(datas, db, 16)
+	benchmarkRandomReadMultiThread(datas, db, 24)
+	benchmarkRandomReadMultiThread(datas, db, 32)
+	benchmarkRandomReadMultiThread(datas, db, 48)
+	benchmarkRandomReadMultiThread(datas, db, 64)
+	// 512page
+	//start random read benchmark, concurrency=1
+	//random read cost 110631ms
+	//start random read benchmark, concurrency=4
+	//random read cost 34848ms
+	//start random read benchmark, concurrency=8
+	//random read cost 25173ms
+	//start random read benchmark, concurrency=12
+	//random read cost 20969ms
+	//start random read benchmark, concurrency=16
+	//random read cost 15841ms
+	//start random read benchmark, concurrency=24
+	//random read cost 17974ms
+	//start random read benchmark, concurrency=32
+	//random read cost 19796ms
+	//start random read benchmark, concurrency=48
+	//random read cost 17226ms
+	//start random read benchmark, concurrency=64
+	//random read cost 17620ms
+
+	// 4096page
+	//start random read benchmark, concurrency=1
+	//random read cost 170569ms
+	//start random read benchmark, concurrency=4
+	//random read cost 39710ms
+	//start random read benchmark, concurrency=8
+	//random read cost 25718ms
+	//start random read benchmark, concurrency=12
+	//random read cost 21013ms
+	//start random read benchmark, concurrency=16
+	//random read cost 18012ms
+	//start random read benchmark, concurrency=24
+	//random read cost 17086ms
+	//start random read benchmark, concurrency=32
+	//random read cost 16808ms
+	//start random read benchmark, concurrency=48
+	//random read cost 16638ms
+	//start random read benchmark, concurrency=64
+	//random read cost 17269ms
+
+	// 4096page * 16 * 16
+	//start random read benchmark, concurrency=1
+	//random read cost 79698ms
+	//start random read benchmark, concurrency=4
+	//random read cost 21925ms
+	//start random read benchmark, concurrency=8
+	//random read cost 13801ms
+	//start random read benchmark, concurrency=12
+	//random read cost 10643ms
+	//start random read benchmark, concurrency=16
+	//random read cost 9957ms
+	//start random read benchmark, concurrency=24
+	//random read cost 9962ms
+	//start random read benchmark, concurrency=32
+	//random read cost 9098ms
+	//start random read benchmark, concurrency=48
+	//random read cost 9922ms
+	//start random read benchmark, concurrency=64
+	//random read cost 9062ms
+}
+
+func Test_pebble_r(t *testing.T) {
+	// 打开已经生成的数据
+	db := MustDB("test-db", false, EnablePebble, func(options *Options) *Options {
+		options.FS = vfs.Default
+		options.DisableAutomaticCompactions = false
+
+		options.FileFormat = sstable.TableFormatLevelDB
+		pagesize := 4 << 10 // 4KB
+		options.CacheSize = int64(4096 * 16 * 16 * pagesize)
+		options.MaxConcurrentCompactions = func() int { return 8 }
+
+		options.ReadOnly = true // important
+		return options
+	})
+
+	times := 128 // 48
+	datas := make([]uint64, 0, times<<20)
+	for i := 0; i < times; i++ {
+		path := filepath.Join("pmttestdata", fmt.Sprintf("normal_plus_round_%03d.bin", i))
+		d := LoadDataFile(path)
+		datas = append(datas, d.Keys...)
+	}
+
+	//avg(db)
+	benchmarkRandomReadMultiThread(datas, db, 1)
+	benchmarkRandomReadMultiThread(datas, db, 4)
+	benchmarkRandomReadMultiThread(datas, db, 8)
+	benchmarkRandomReadMultiThread(datas, db, 12)
+	benchmarkRandomReadMultiThread(datas, db, 16)
+	benchmarkRandomReadMultiThread(datas, db, 24)
+	benchmarkRandomReadMultiThread(datas, db, 32)
+	benchmarkRandomReadMultiThread(datas, db, 48)
+	benchmarkRandomReadMultiThread(datas, db, 64)
 }
 
 // normal_plus
@@ -290,8 +392,13 @@ func Test_pebble_wa(t *testing.T) {
 // normal_plus, 128,
 func Test_pmt_wa(t *testing.T) {
 	println(fmt.Sprintf("GOMAXPROCS=%d", runtime.GOMAXPROCS(0)))
-	db := MustDB(func(options *Options) *Options {
+	db := MustDB("mybench_pmt", true, func(options *Options) *Options {
 		options.FS = vfs.Default
+
+		pmtinternal.EnablePMTTableFormat = true
+		options.FileFormat = sstable.TableFormatPMT0
+		//options.FileFormat = sstable.TableFormatPebblev6
+
 		pagesize := 4 << 10                       // 4KB
 		options.CacheSize = int64(512 * pagesize) //
 		options.DisableAutomaticCompactions = true
@@ -350,7 +457,69 @@ func Test_pmt_wa(t *testing.T) {
 	// pmt 256pagescache nocompression 64round, 0.037516
 
 	// pmt 256pagescache nocompression 128round, 47.1us
-	benchmarkRandomRead(datas, db)
+	//benchmarkRandomRead(datas, db)
+
+	benchmarkRandomReadMultiThread(datas, db, 1)
+	benchmarkRandomReadMultiThread(datas, db, 4)
+	benchmarkRandomReadMultiThread(datas, db, 8)
+	benchmarkRandomReadMultiThread(datas, db, 12)
+	benchmarkRandomReadMultiThread(datas, db, 16)
+	benchmarkRandomReadMultiThread(datas, db, 24)
+	benchmarkRandomReadMultiThread(datas, db, 32)
+	benchmarkRandomReadMultiThread(datas, db, 48)
+	benchmarkRandomReadMultiThread(datas, db, 64)
+	//TableFormatPebblev6-----------------------------------
+	//start random read benchmark, concurrency=1
+	//random read cost 387120ms
+	//start random read benchmark, concurrency=4
+	//random read cost 128012ms
+	//start random read benchmark, concurrency=8
+	//random read cost 81403ms
+	//start random read benchmark, concurrency=12
+	//random read cost 62984ms
+	//start random read benchmark, concurrency=16
+	//random read cost 58804ms
+	//start random read benchmark, concurrency=24
+	//random read cost 58741ms
+	//start random read benchmark, concurrency=32
+	//random read cost 58445ms
+	//start random read benchmark, concurrency=48
+	//random read cost 57948ms
+	//start random read benchmark, concurrency=64
+	//random read cost 59463ms
+}
+
+// normal_plus, 128,
+func Test_pmt_e(t *testing.T) {
+	println(fmt.Sprintf("GOMAXPROCS=%d", runtime.GOMAXPROCS(0)))
+	db := MustDB("mybench_pmt", false, func(options *Options) *Options {
+		options.FS = vfs.Default
+		options.FileFormat = sstable.TableFormatPebblev6
+		pagesize := 4 << 10                        // 4KB
+		options.CacheSize = int64(4096 * pagesize) //
+		options.DisableAutomaticCompactions = true
+		options.MaxConcurrentCompactions = func() int { return 8 }
+		options.ReadOnly = true // important
+		return options
+	})
+
+	times := 128 // 128
+	datas := make([]uint64, 0, times<<20)
+	for i := 0; i < times; i++ {
+		path := filepath.Join("pmttestdata", fmt.Sprintf("normal_plus_round_%03d.bin", i))
+		d := LoadDataFile(path)
+		datas = append(datas, d.Keys...)
+	}
+
+	benchmarkRandomReadMultiThread(datas, db, 1)
+	benchmarkRandomReadMultiThread(datas, db, 4)
+	benchmarkRandomReadMultiThread(datas, db, 8)
+	benchmarkRandomReadMultiThread(datas, db, 12)
+	benchmarkRandomReadMultiThread(datas, db, 16)
+	benchmarkRandomReadMultiThread(datas, db, 24)
+	benchmarkRandomReadMultiThread(datas, db, 32)
+	benchmarkRandomReadMultiThread(datas, db, 48)
+	benchmarkRandomReadMultiThread(datas, db, 64)
 }
 
 // 可能需要用全局变量判断, 目前只用writeBarrierFS
@@ -358,7 +527,7 @@ func Test_pmt_wa(t *testing.T) {
 func Test_concurrent(t *testing.T) {
 	println(fmt.Sprintf("GOMAXPROCS=%d", runtime.GOMAXPROCS(0)))
 	barrier := newWriteBarrier(2)
-	db := MustDB(func(options *Options) *Options {
+	db := MustDB("test-db", true, func(options *Options) *Options {
 		// Block on first sstable write to verify concurrent "write to disk".
 		options.FS = &writeBarrierFS{FS: vfs.Default, b: barrier}
 		pagesize := 4 << 10                       // 4KB
@@ -560,7 +729,7 @@ deviation=1 << 32，第一次写入后的划分点
 // 4: 97/4
 // 5: 126/12
 func Test_pebble_1(t *testing.T) {
-	db := MustDB(EnablePebble, func(options *Options) *Options {
+	db := MustDB("test-db", true, EnablePebble, func(options *Options) *Options {
 		options.DisableAutomaticCompactions = true
 		return options
 	})
@@ -596,7 +765,7 @@ func Test_make_sst(t *testing.T) {
 	//use(m, tw)
 
 	//db := PMT()
-	db := MustDB()
+	db := MustDB("test-db", true)
 	meta := makeSST(db, vfs.Default.PathJoin("tmp", "a0"), []uint64{1, 10})
 	meta = makeSST(db, vfs.Default.PathJoin("tmp", "a1"), []uint64{1, 11})
 	meta = makeSST(db, vfs.Default.PathJoin("tmp", "a2"), []uint64{10, 15})
@@ -613,8 +782,7 @@ func Test_MustIngestToLevel(t *testing.T) {
 	}
 	println(cwd)
 
-	//db := PMT()
-	db := MustDB()
+	db := MustDB("test-db", true)
 	MustIngestToLevel(db, "tmp", "a0", 0)
 	MustIngestToLevel(db, "tmp", "a1", 1)
 	MustIngestToLevel(db, "tmp", "a2", 2)
@@ -628,7 +796,7 @@ func Test_MustIngestToLevel(t *testing.T) {
 
 // bypass plan
 func Test_multilevelFlush(t *testing.T) {
-	db := MustDB()
+	db := MustDB("test-db", true)
 
 	spList := []SubPart{
 		SubPart{
@@ -749,7 +917,7 @@ func Test_multilevelFlush_pprof(t *testing.T) {
 		_ = f.Close()
 	}()
 
-	db := MustDB(func(options *Options) *Options {
+	db := MustDB("test-db", true, func(options *Options) *Options {
 		options.FS = vfs.Default
 		pagesize := 4 << 10
 		options.CacheSize = int64(512 * pagesize)

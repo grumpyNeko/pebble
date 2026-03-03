@@ -345,15 +345,16 @@ func MustFind(list []base.FileNum, target uint64) int {
 
 type OptionPatch func(options *Options) *Options
 
-func MustDB(list ...OptionPatch) *DB {
+func MustDB(path string, clear bool, list ...OptionPatch) *DB {
 	opts := pmtOptions()
 	for _, e := range list {
 		opts = e(opts)
 	}
-	const path = "test-db"
 	// 删除所有数据
-	if err := os.RemoveAll(path); err != nil {
-		panic(err)
+	if clear {
+		if err := os.RemoveAll(path); err != nil {
+			panic(err)
+		}
 	}
 	db, err := Open(path, opts)
 	if err != nil {
@@ -437,9 +438,16 @@ func (d *DB) MustGet(key []byte) (val []byte, filesAccessed int) {
 		if err != nil {
 			panic(err)
 		}
-		panic("why not found")
+		if len(key) != 8 {
+			panic(fmt.Sprintf("not found key(len=%d,hex=%x)", len(key), key))
+		}
+		panic(fmt.Sprintf("not found key=%d", binary.BigEndian.Uint64(key)))
 	}
-	return i.Value(), get.filesAccessed
+	val = append([]byte(nil), i.Value()...)
+	if err := i.Close(); err != nil {
+		panic(err)
+	}
+	return val, get.filesAccessed
 }
 
 // PMTGet performs a PMT-specific lookup path:

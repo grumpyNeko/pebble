@@ -28,10 +28,20 @@ columnarblock，把key/trailer/value分列编码，固定长度数据省开销
   列7: prefixChanged[]   (位图)                                                                                                                                                                                                                   
   Padding      
 
-# 新增SSTable格式
-TableFormatPMT0
-4KB DataPage + IndexPage
-只支持SET,  key/value都是8字节
+# 新增TableFormatPMT0
+只支持SET, key/value都是uint64
++---------------------------+
+|        DataPage           |
++---------------------------+
+|          ...              |
++---------------------------+
+|        DataPage           |
++---------------------------+
+|        IndexPage          |
++---------------------------+
+IndexPage, 4KB, userkey的有序数组
+DataPage, 4KB, {userkey,val}的有序数组
+
 RawWriter适配
 通过EnablePMTTableFormat开关
 没接入Pebble read path: DB.Get -> getIter -> newIters -> sstable.NewReader
