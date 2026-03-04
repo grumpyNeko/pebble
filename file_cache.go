@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/keyspan/keyspanimpl"
 	"github.com/cockroachdb/pebble/internal/manifest"
+	"github.com/cockroachdb/pebble/internal/pmtinternal"
 	"github.com/cockroachdb/pebble/internal/sstableinternal"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider/objiotracing"
@@ -210,6 +211,9 @@ func (h *fileCacheHandle) openFile(
 	}
 	switch fileType {
 	case base.FileTypeTable:
+		if pmtinternal.EnablePMT && pmtinternal.EnablePMTTableFormat {
+			panic("pebble: PMT tables are opened via PMT newIters path")
+		}
 		r, err := sstable.NewReader(ctx, f, o)
 		if err != nil {
 			return nil, objMeta, err
@@ -541,6 +545,10 @@ func (h *fileCacheHandle) newIters(
 	internalOpts internalIterOpts,
 	kinds iterKinds,
 ) (iterSet, error) {
+	if pmtinternal.EnablePMT && pmtinternal.EnablePMTTableFormat {
+		return h.newPMTIters(ctx, file, opts, internalOpts, kinds)
+	}
+
 	// Calling findOrCreate gives us the responsibility of Unref()ing vRef.
 	vRef, err := h.findOrCreateTable(ctx, file)
 	if err != nil {

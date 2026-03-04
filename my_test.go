@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/pmtinternal"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
@@ -107,31 +108,19 @@ db.manualCompact(BigEndian(2), BigEndian(10), 0, false)
 println(db.LSMViewURL())
 */
 func Test_pmt_basic(t *testing.T) {
-	db := MustDB("test-db", true, func(options *Options) *Options {
+	db := MustDB("tmp_db/pmt_basic", true, func(options *Options) *Options {
+		pmtinternal.EnablePMTTableFormat = true
+		options.FileFormat = sstable.TableFormatPMT0
 		return options
 	})
-	origPartIdx := pmtinternal.PartIdx
-	origSstMap := pmtinternal.SstMap
-	defer func() {
-		pmtinternal.PartIdx = origPartIdx
-		pmtinternal.SstMap = origSstMap
-	}()
-	pmtinternal.PartIdx = []pmtinternal.Part{
-		{
-			Low:   0,
-			High:  math.MaxUint64,
-			Stack: nil,
-		},
-	}
-	pmtinternal.SstMap = make(map[uint64]pmtinternal.SstInfo, 1024)
+	defer db.Close()
 
 	path := filepath.Join("pmttestdata", "normal_plus_round_000.bin")
 	d := LoadDataFile(path)
 	keys := d.Keys
 
 	spList := plan()
-	// 一个Table最多131072个KV, 超出就生成多个Table, 不应该报错的, 问题出在哪
-	multilevelFlushConcurrent(db, keys, uint64(0), spList, 2)
+	multilevelFlushConcurrent(db, keys, uint64(17), spList, 2)
 	pmtinternal.PartIdx = newPartIdxFromSubParts(spList)
 
 	metrics := db.Metrics()
@@ -140,11 +129,62 @@ func Test_pmt_basic(t *testing.T) {
 	}
 	use(metrics)
 	use(pmtinternal.PartIdx)
+
+	for _, k := range keys {
+		val, _ := db.MustGet(BigEndian(k))
+		if len(val) != 8 {
+			t.Fatalf("MustGet(%d) value len=%d", k, len(val))
+		}
+		if got := binary.BigEndian.Uint64(val); got != 17 {
+			t.Fatalf("MustGet(%d) value=%d want=17", k, got)
+		}
+	}
+
+	iter, err := db.NewIter(&IterOptions{})
+	if err != nil {
+		t.Fatalf("NewIter failed: %v", err)
+	}
+	defer func() {
+		if cerr := iter.Close(); cerr != nil {
+			t.Fatalf("iter close failed: %v", cerr)
+		}
+	}()
+
+	var (
+		prev    uint64
+		hasPrev bool
+		seen    int
+	)
+	for iter.First(); iter.Valid(); iter.Next() {
+		k := binary.BigEndian.Uint64(iter.Key())
+		if hasPrev && k <= prev {
+			t.Fatalf("range read not strictly increasing: prev=%d current=%d", prev, k)
+		}
+		if _, ok := d.M[k]; !ok {
+			t.Fatalf("range read key=%d not in source dataset", k)
+		}
+		prev = k
+		hasPrev = true
+		seen++
+	}
+	if err := iter.Error(); err != nil {
+		t.Fatalf("iter error: %v", err)
+	}
+	if seen != len(d.M) {
+		t.Fatalf("range read count mismatch: seen=%d want=%d", seen, len(d.M))
+	}
 }
 
 func Test_PMTGet(t *testing.T) {
-	db := MustDB("test-db", true)
-	// Two flushes for the same key. PMTGet should probe stack from newest to oldest.
+	db := MustDB("tmp_db/pmt_get", true, func(options *Options) *Options {
+		pmtinternal.EnablePMTTableFormat = true
+		options.FileFormat = sstable.TableFormatPMT0
+		options.DisableAutomaticCompactions = true
+		return options
+	})
+	defer db.Close()
+
+	// Two flushes for the same key. PMTGet should probe newest table first.
 	batchWrite(db, []uint64{2}, 1)
 	batchWrite(db, []uint64{2}, 9)
 
@@ -159,11 +199,93 @@ func Test_PMTGet(t *testing.T) {
 		t.Fatalf("PMTGet(2) expected tableCt >= 1, got %d", tableCt)
 	}
 
-	v, found, tableCt = db.PMTGet(999)
+	v, found, _ = db.PMTGet(999)
 	if found {
 		t.Fatalf("PMTGet(999) expected not found, got value=%d", v)
 	}
-	use(tableCt)
+}
+
+/*
+用pmtformat.NewWriter写
+用pmtformat.NewIter直接读
+*/
+func Test_PMT_NewIters_Point(t *testing.T) {
+	var buf bytes.Buffer
+	w := pmtformat.NewWriter(&buf)
+	keys := []uint64{1, 3, 7, 8, 21, 34}
+	for _, k := range keys {
+		if err := w.Add(k, k); err != nil {
+			t.Fatalf("Add(%d) failed: %v", k, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("writer close failed: %v", err)
+	}
+
+	data := buf.Bytes()
+	it, err := pmtformat.NewIter(pmtTestReadable{r: bytes.NewReader(data)}, int64(len(data)), base.SeqNum(1))
+	if err != nil {
+		t.Fatalf("new PMT iter failed: %v", err)
+	}
+
+	tests := []struct {
+		seek  uint64
+		want  uint64
+		found bool
+	}{
+		{seek: 0, want: 1, found: true},
+		{seek: 1, want: 1, found: true},
+		{seek: 2, want: 3, found: true},
+		{seek: 7, want: 7, found: true},
+		{seek: 9, want: 21, found: true},
+		{seek: 34, want: 34, found: true},
+		{seek: 35, found: false},
+	}
+	for _, tc := range tests {
+		kv := it.SeekGE(BigEndian(tc.seek), base.SeekGEFlagsNone)
+		if !tc.found {
+			if kv != nil {
+				got := binary.BigEndian.Uint64(kv.K.UserKey)
+				t.Fatalf("SeekGE(%d) got key=%d, want nil", tc.seek, got)
+			}
+			continue
+		}
+		if kv == nil {
+			t.Fatalf("SeekGE(%d) returned nil", tc.seek)
+		}
+		gotKey := binary.BigEndian.Uint64(kv.K.UserKey)
+		if gotKey != tc.want {
+			t.Fatalf("SeekGE(%d) got key=%d want=%d", tc.seek, gotKey, tc.want)
+		}
+		val, _, err := kv.Value(nil)
+		if err != nil {
+			t.Fatalf("SeekGE(%d) value error: %v", tc.seek, err)
+		}
+		gotVal := binary.BigEndian.Uint64(val)
+		if gotVal != tc.want {
+			t.Fatalf("SeekGE(%d) got value=%d want=%d", tc.seek, gotVal, tc.want)
+		}
+	}
+	if err := it.Close(); err != nil {
+		t.Fatalf("point iterator close failed: %v", err)
+	}
+}
+
+type pmtTestReadable struct {
+	r *bytes.Reader
+}
+
+func (tr pmtTestReadable) ReadAt(_ context.Context, p []byte, off int64) error {
+	_, err := tr.r.ReadAt(p, off)
+	return err
+}
+
+func (pmtTestReadable) Close() error {
+	return nil
+}
+
+func Test_PMT_CompactAndWrite(t *testing.T) {
+	// todo: ..
 }
 
 func Test_split(t *testing.T) {
@@ -468,7 +590,7 @@ func Test_pmt_wa(t *testing.T) {
 	benchmarkRandomReadMultiThread(datas, db, 32)
 	benchmarkRandomReadMultiThread(datas, db, 48)
 	benchmarkRandomReadMultiThread(datas, db, 64)
-	//TableFormatPebblev6-----------------------------------
+	//TableFormatPebblev6-----------------------------------, avg filesAccessed 6.78
 	//start random read benchmark, concurrency=1
 	//random read cost 387120ms
 	//start random read benchmark, concurrency=4
@@ -487,16 +609,61 @@ func Test_pmt_wa(t *testing.T) {
 	//random read cost 57948ms
 	//start random read benchmark, concurrency=64
 	//random read cost 59463ms
+
+	//TableFormatPMT-----------------------------------512page, avg filesAccessed 6.78
+	//start random read benchmark, concurrency=1
+	//random read cost 271713ms
+	//start random read benchmark, concurrency=4
+	//random read cost 95436ms
+	//start random read benchmark, concurrency=8
+	//random read cost 63884ms
+	//start random read benchmark, concurrency=12
+	//random read cost 51712ms
+	//start random read benchmark, concurrency=16
+	//random read cost 47035ms
+	//start random read benchmark, concurrency=24
+	//random read cost 44765ms
+	//start random read benchmark, concurrency=32
+	//random read cost 44406ms
+	//start random read benchmark, concurrency=48
+	//random read cost 44782ms
+	//start random read benchmark, concurrency=64
+	//random read cost 45203ms
+
+	//TableFormatPMT-----------------------------------4096page, avg filesAccessed 6.78
+	//start random read benchmark, concurrency=1
+	//random read cost 271350ms
+	//start random read benchmark, concurrency=4
+	//random read cost 98376ms
+	//start random read benchmark, concurrency=8
+	//random read cost 64215ms
+	//start random read benchmark, concurrency=12
+	//random read cost 52792ms
+	//start random read benchmark, concurrency=16
+	//random read cost 47914ms
+	//start random read benchmark, concurrency=24
+	//random read cost 47977ms
+	//start random read benchmark, concurrency=32
+	//random read cost 45602ms
+	//start random read benchmark, concurrency=48
+	//random read cost 45147ms
+	//start random read benchmark, concurrency=64
+	//random read cost 46289ms
+
 }
 
 // normal_plus, 128,
-func Test_pmt_e(t *testing.T) {
+func Test_pmt_r(t *testing.T) {
 	println(fmt.Sprintf("GOMAXPROCS=%d", runtime.GOMAXPROCS(0)))
 	db := MustDB("mybench_pmt", false, func(options *Options) *Options {
 		options.FS = vfs.Default
-		options.FileFormat = sstable.TableFormatPebblev6
-		pagesize := 4 << 10                        // 4KB
-		options.CacheSize = int64(4096 * pagesize) //
+
+		pmtinternal.EnablePMTTableFormat = true
+		options.FileFormat = sstable.TableFormatPMT0
+		//options.FileFormat = sstable.TableFormatPebblev6
+
+		pagesize := 4 << 10                                  // 4KB
+		options.CacheSize = int64(4096 * 16 * 16 * pagesize) //
 		options.DisableAutomaticCompactions = true
 		options.MaxConcurrentCompactions = func() int { return 8 }
 		options.ReadOnly = true // important
@@ -520,6 +687,7 @@ func Test_pmt_e(t *testing.T) {
 	benchmarkRandomReadMultiThread(datas, db, 32)
 	benchmarkRandomReadMultiThread(datas, db, 48)
 	benchmarkRandomReadMultiThread(datas, db, 64)
+
 }
 
 // 可能需要用全局变量判断, 目前只用writeBarrierFS
@@ -595,6 +763,8 @@ func benchmarkRandomReadMultiThread(datas []uint64, db *DB, concurrency int) {
 	println(fmt.Sprintf("start random read benchmark, concurrency=%d", concurrency))
 	start := time.Now()
 	var wg sync.WaitGroup
+	var totalFilesAccessed atomic.Int64
+	var totalReads atomic.Int64
 	chunk := (readN + concurrency - 1) / concurrency
 	for g := 0; g < concurrency; g++ {
 		begin := g * chunk
@@ -609,13 +779,19 @@ func benchmarkRandomReadMultiThread(datas []uint64, db *DB, concurrency int) {
 		wg.Add(1)
 		go func(keys []uint64) {
 			defer wg.Done()
+			var localFilesAccessed int64
 			for _, k := range keys {
-				db.MustGet(BigEndian(k))
+				_, filesAccessed := db.MustGet(BigEndian(k))
+				localFilesAccessed += int64(filesAccessed)
 			}
+			totalFilesAccessed.Add(localFilesAccessed)
+			totalReads.Add(int64(len(keys)))
 		}(keys)
 	}
 	wg.Wait()
 	println(fmt.Sprintf("random read cost %dms", time.Since(start).Milliseconds()))
+	avgFilesAccessed := float64(totalFilesAccessed.Load()) / float64(totalReads.Load())
+	println(fmt.Sprintf("avg filesAccessed %.4f", avgFilesAccessed))
 }
 
 func benchmarkRandomReadWithCPUProfile(t *testing.T, datas []uint64, db *DB, profPath string) {
@@ -959,7 +1135,7 @@ func plan() []SubPart {
 			Outputs: nil,
 		}
 		if len(sp.Stack) > 6 {
-			println("oh!")
+			println("len(sp.Stack) > 6")
 			sp.WriteTo = 0
 		}
 		ret = append(ret, sp)
@@ -1059,31 +1235,62 @@ func Test_PMT_Format_Basic(t *testing.T) {
 		t.Fatalf("pmt close failed: %v", err)
 	}
 
-	r, err := pmtformat.NewReader(bytes.NewReader(tableBuf.Bytes()), int64(tableBuf.Len()))
+	it, err := pmtformat.NewIter(
+		pmtTestReadable{r: bytes.NewReader(tableBuf.Bytes())},
+		int64(tableBuf.Len()),
+		base.SeqNum(1),
+	)
 	if err != nil {
-		t.Fatalf("pmt reader create failed: %v", err)
+		t.Fatalf("pmt iter create failed: %v", err)
 	}
+	defer func() {
+		if err := it.Close(); err != nil {
+			t.Fatalf("pmt iter close failed: %v", err)
+		}
+	}()
 
 	// check all point read
 	for _, k := range keys {
-		v, ok := r.Get(k)
-		if !ok || v != k {
-			t.Fatalf("point read failed: key=%d, val=%d, ok=%v", k, v, ok)
+		kv := it.SeekGE(BigEndian(k), base.SeekGEFlagsNone)
+		if kv == nil {
+			t.Fatalf("point read failed: key=%d, got nil", k)
+		}
+		gotKey := binary.BigEndian.Uint64(kv.K.UserKey)
+		if gotKey != k {
+			t.Fatalf("point read failed: key=%d, got key=%d", k, gotKey)
+		}
+		v, _, err := kv.Value(nil)
+		if err != nil {
+			t.Fatalf("point read value decode failed: key=%d, err=%v", k, err)
+		}
+		gotVal := binary.BigEndian.Uint64(v)
+		if gotVal != k {
+			t.Fatalf("point read failed: key=%d, got val=%d", k, gotVal)
 		}
 	}
 
 	// check all range read
-	entries := r.Entries()
-	if len(entries) != len(keys) {
-		t.Fatalf("entries len mismatch: expected %d, got %d", len(keys), len(entries))
+	i := 0
+	for kv := it.First(); kv != nil; kv = it.Next() {
+		if i >= len(keys) {
+			t.Fatalf("range read has extra entries, first extra key=%d", binary.BigEndian.Uint64(kv.K.UserKey))
+		}
+		gotKey := binary.BigEndian.Uint64(kv.K.UserKey)
+		if gotKey != keys[i] {
+			t.Fatalf("range read key mismatch at %d: expected %d, got %d", i, keys[i], gotKey)
+		}
+		v, _, err := kv.Value(nil)
+		if err != nil {
+			t.Fatalf("range read value decode failed at %d: %v", i, err)
+		}
+		gotVal := binary.BigEndian.Uint64(v)
+		if gotVal != keys[i] {
+			t.Fatalf("range read value mismatch at %d: expected %d, got %d", i, keys[i], gotVal)
+		}
+		i++
 	}
-	for i := range entries {
-		if entries[i].UserKey != keys[i] {
-			t.Fatalf("range read key mismatch at %d: expected %d, got %d", i, keys[i], entries[i].UserKey)
-		}
-		if entries[i].Value != keys[i] {
-			t.Fatalf("range read value mismatch at %d: expected %d, got %d", i, keys[i], entries[i].Value)
-		}
+	if i != len(keys) {
+		t.Fatalf("entries len mismatch: expected %d, got %d", len(keys), i)
 	}
 }
 

@@ -1,7 +1,6 @@
 package pebble
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -444,10 +443,11 @@ func (d *DB) MustGet(key []byte) (val []byte, filesAccessed int) {
 		panic(fmt.Sprintf("not found key=%d", binary.BigEndian.Uint64(key)))
 	}
 	val = append([]byte(nil), i.Value()...)
+	filesAccessed = get.filesAccessed
 	if err := i.Close(); err != nil {
 		panic(err)
 	}
-	return val, get.filesAccessed
+	return val, filesAccessed
 }
 
 // PMTGet performs a PMT-specific lookup path:
@@ -459,7 +459,7 @@ func (d *DB) PMTGet(k uint64) (v uint64, found bool, tableCt int) {
 	}
 	part, ok := pmtPartForKey(k)
 	if !ok || len(part.Stack) == 0 {
-		panic("why")
+		return 0, false, 0
 	}
 	// Copy stack to avoid races with concurrent PartIdx updates.
 	stack := append([]base.FileNum(nil), part.Stack...)
@@ -497,7 +497,7 @@ func (d *DB) PMTGet(k uint64) (v uint64, found bool, tableCt int) {
 			continue
 		}
 		tableCt++
-		if val, ok := d.pmtGetFromFile(meta.FileNum, k); ok {
+		if val, ok := d.pmtGetFromFile(meta, k); ok {
 			return val, true, tableCt
 		}
 	}
@@ -528,36 +528,65 @@ func pmtPartForKey(k uint64) (pmtinternal.Part, bool) {
 	return pmtinternal.Part{}, false
 }
 
-func (d *DB) pmtGetFromFile(fileNum base.FileNum, k uint64) (uint64, bool) {
+func (d *DB) pmtGetFromFile(meta *tableMetadata, k uint64) (uint64, bool) {
+	if meta == nil {
+		return 0, false
+	}
 	f, err := d.objProvider.OpenForReading(
 		context.Background(),
 		base.FileTypeTable,
-		base.DiskFileNum(fileNum),
+		meta.FileBacking.DiskFileNum,
 		objstorage.OpenOptions{MustExist: true},
 	)
 	if err != nil {
 		panic(err)
 	}
-	defer func() {
-		if err := f.Close(); err != nil {
-			panic(err)
-		}
-	}()
 
 	size := f.Size()
 	if size <= 0 {
+		if err := f.Close(); err != nil {
+			panic(err)
+		}
 		return 0, false
 	}
 
-	buf := make([]byte, size)
-	if err := f.ReadAt(context.Background(), buf, 0); err != nil {
+	seqNum := meta.LargestSeqNum
+	if seqNum < meta.SmallestSeqNum {
+		seqNum = meta.SmallestSeqNum
+	}
+	iter, err := pmtformat.NewIter(f, size, seqNum)
+	if err != nil {
+		_ = f.Close()
+		panic(fmt.Sprintf("PMTGet open PMT iter failed for file %d: %v", meta.FileNum, err))
+	}
+	defer func() {
+		if err := iter.Close(); err != nil {
+			panic(err)
+		}
+	}()
+	iter.SetContext(context.Background())
+
+	var keyBuf [8]byte
+	binary.BigEndian.PutUint64(keyBuf[:], k)
+	kv := iter.SeekGE(keyBuf[:], base.SeekGEFlagsNone)
+	if err := iter.Error(); err != nil {
 		panic(err)
 	}
-	r, err := pmtformat.NewReader(bytes.NewReader(buf), size)
-	if err != nil {
-		panic(fmt.Sprintf("PMTGet open PMT reader failed for file %d: %v", fileNum, err))
+	if kv == nil {
+		return 0, false
 	}
-	return r.Get(k)
+	gotKey := binary.BigEndian.Uint64(kv.K.UserKey)
+	if gotKey != k {
+		return 0, false
+	}
+	v, _, err := kv.Value(nil)
+	if err != nil {
+		panic(err)
+	}
+	if len(v) != 8 {
+		panic(fmt.Sprintf("PMTGet invalid value length %d in file %d", len(v), meta.FileNum))
+	}
+	return binary.BigEndian.Uint64(v), true
 }
 
 func printKeys(db *DB) {
