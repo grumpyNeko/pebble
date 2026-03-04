@@ -78,8 +78,22 @@ SeqNum<-FileMetadata.LargestSeqNum
 - getIter 在 getSSTableIterators:263 调 g.newIters(..., iterPointKeys|iterRangeDeletions)。
 - PMT 分流后同样进入 newPMTIters:15，point 直接是 pmtformat.Iter，不再经过 pmtTableReader/pmtformat.Reader。
 
+# TableFormatPMT读路径接入BlockCache
+compaction的读取不缓存 // 而且结束时清除
 
-# 改动
+其他tableformat用sstable.Reader/block.Reader
+pmt没有footer/metaindex/index/properties, 直接pmtformat.NewIter
+这样跳过了tableCache和blockCache
+
+用pmtCachedReadable包Readable, 传给pmtformat.NewIter, 增加BlockCache逻辑
+- blockCacheHandle.GetWithReadHandle(..)
+  IF hit, ..
+  IF miss, alloc, read, set, release
+  为什么set后要release? ..
+- Close, 先关ReadHandle再关Readable
+- compaction的读取不缓存：internalOpts.compaction时只走ReadHandle.SetupForCompaction()
+- 计数hit/miss?  db.Metrics()..BlockCache.Misses
+
 
 
 

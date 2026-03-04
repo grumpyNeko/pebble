@@ -630,26 +630,6 @@ func Test_pmt_wa(t *testing.T) {
 	//start random read benchmark, concurrency=64
 	//random read cost 45203ms
 
-	//TableFormatPMT-----------------------------------4096page, avg filesAccessed 6.78
-	//start random read benchmark, concurrency=1
-	//random read cost 271350ms
-	//start random read benchmark, concurrency=4
-	//random read cost 98376ms
-	//start random read benchmark, concurrency=8
-	//random read cost 64215ms
-	//start random read benchmark, concurrency=12
-	//random read cost 52792ms
-	//start random read benchmark, concurrency=16
-	//random read cost 47914ms
-	//start random read benchmark, concurrency=24
-	//random read cost 47977ms
-	//start random read benchmark, concurrency=32
-	//random read cost 45602ms
-	//start random read benchmark, concurrency=48
-	//random read cost 45147ms
-	//start random read benchmark, concurrency=64
-	//random read cost 46289ms
-
 }
 
 // normal_plus, 128,
@@ -670,7 +650,7 @@ func Test_pmt_r(t *testing.T) {
 		return options
 	})
 
-	times := 128 // 128
+	times := 8 // 128
 	datas := make([]uint64, 0, times<<20)
 	for i := 0; i < times; i++ {
 		path := filepath.Join("pmttestdata", fmt.Sprintf("normal_plus_round_%03d.bin", i))
@@ -687,7 +667,6 @@ func Test_pmt_r(t *testing.T) {
 	benchmarkRandomReadMultiThread(datas, db, 32)
 	benchmarkRandomReadMultiThread(datas, db, 48)
 	benchmarkRandomReadMultiThread(datas, db, 64)
-
 }
 
 // 可能需要用全局变量判断, 目前只用writeBarrierFS
