@@ -1,5 +1,9 @@
-pmt是在pebble基础上的增强, 大量使用goto跳过一部分原有逻辑
+pmt是在pebble基础上的增强: 全局划分, 多层刷盘, ...
+不要这里改一下那里改一下, 新逻辑要集中:
+  用goto跳过逻辑
+  pmtstate.go
 
+  
 
 - 增加Part和PartIdx
 把键范围切成若干Part
@@ -45,47 +49,44 @@ DataPage, 4KB, {userkey,val}的有序数组
 RawWriter适配
 通过EnablePMTTableFormat开关
 
-Options增加字段FileFormat
+直接设置FileFormat, 不止为了PMT, 也方便对比其他tableformat
+在Options中增加了字段FileFormat // 确实侵入了
 在DB.TableFormat()中优先使用opts.FileFormat, 原先取FormatMajorVersion再按实验开关降级
 
 # 专门的查找PMTGet(k)
 PartIdx + SstMap + Stack
 返回(v, found, tableCt)
 
-# pmtformat.Iter直连Get/Compact
-不需pmtTableReader/pmtformat.Reader
-在Get或Compact过程中直接用pmtformat.Iter
-[ ] 在pmtformat中新增Iter
+# pmtformat.Iter用于Get/Compact
 SeekGE/First/Next/SeekLT/Prev
 SetBounds
 Error/Close/SetContext
 按Page懒加载
 Kind<-InternalKeyKindSet
 SeqNum<-FileMetadata.LargestSeqNum
-[ ] 测试Iter, iter_test.go
-- 空表, First/Last/SeekGE/SeekLT
-- First->Next、Last->Prev、SeekGE/SeekLT
-- 257 KV, SeekGE页尾, Next到下一页
-- SeekGE(>max)=nil，SeekLT(<=min)=nil，含SetBounds       
-  [ ] 在compaction路径接入该迭代器
-- 入口是 compactAndWrite:3237，它调用 c.newInputIters(...) 组装输入迭代器。
-- newInputIters 里 point 走 newLevelIter(..., newIters, ...)，最终都会落到 fileCacheHandle.newIters:541。
-- 在 PMT 开关下，newIters 直接分流到 newPMTIters:15，这里构造的是 pmtformat.NewIter(...)（懒加载按 page 读）而不是 sstable reader。
-- newRangeDelIter 单独请求 iterRangeDeletions 时，newPMTIters 不会返回 point，也不会返回 rangedel，所以 newRangeDelIter:1076 会拿到 nil 并跳过。
-- 最后 rangeDelIters/rangeKeyIters 为空，compact.NewIter(cfg, pointIter, nil, nil)，即 point-only compaction。   
-  [ ] 在DB.Get路径接入该迭代器
-- DB.Get 初始化 getIter 时注入 newIters: d.newIters，见 db.go:602。
-- getIter 在 getSSTableIterators:263 调 g.newIters(..., iterPointKeys|iterRangeDeletions)。
-- PMT 分流后同样进入 newPMTIters:15，point 直接是 pmtformat.Iter，不再经过 pmtTableReader/pmtformat.Reader。
+- iter_test.go
+空表, First/Last/SeekGE/SeekLT
+First->Next、Last->Prev、SeekGE/SeekLT
+257 KV, SeekGE页尾, Next到下一页
+SeekGE(>max)=nil，SeekLT(<=min)=nil，含SetBounds       
+- 在compaction路径接入该迭代器
+入口是 compactAndWrite:3237，它调用 c.newInputIters(...) 组装输入迭代器。
+newInputIters 里 point 走 newLevelIter(..., newIters, ...)，最终都会落到 fileCacheHandle.newIters:541。
+在 PMT 开关下，newIters 直接分流到 newPMTIters:15，这里构造的是 pmtformat.NewIter(...)（懒加载按 page 读）而不是 sstable reader。
+newRangeDelIter 单独请求 iterRangeDeletions 时，newPMTIters 不会返回 point，也不会返回 rangedel，所以 newRangeDelIter:1076 会拿到 nil 并跳过。
+最后 rangeDelIters/rangeKeyIters 为空，compact.NewIter(cfg, pointIter, nil, nil)，即 point-only compaction。   
+- 在DB.Get路径接入该迭代器
+DB.Get 初始化 getIter 时注入 newIters: d.newIters，见 db.go:602。
+getIter 在 getSSTableIterators:263 调 g.newIters(..., iterPointKeys|iterRangeDeletions)。
+PMT 分流后同样进入 newPMTIters:15，point 直接是 pmtformat.Iter，不再经过 pmtTableReader/pmtformat.Reader。
 
 # TableFormatPMT读路径接入BlockCache
-compaction的读取不缓存 // 而且结束时清除
 
-其他tableformat用sstable.Reader/block.Reader
-pmt没有footer/metaindex/index/properties, 直接pmtformat.NewIter
-这样跳过了tableCache和blockCache
+其他tableformat涉及sstable.Reader/block.Reader, not pmt
+why? pmt没有footer/metaindex/index/properties
+没有tableCache和blockCache
 
-用pmtCachedReadable包Readable, 传给pmtformat.NewIter, 增加BlockCache逻辑
+pmtformat.NewIter, 用pmtCachedReadable包Readable, 传给pmtformat.NewIter, 增加BlockCache逻辑
 - blockCacheHandle.GetWithReadHandle(..)
   IF hit, ..
   IF miss, alloc, read, set, release
