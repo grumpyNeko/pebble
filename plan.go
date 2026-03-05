@@ -29,10 +29,10 @@ type PlanStat struct {
 	Reason   string
 }
 
-var planHistory [][]PlanStat
+var planHistoryList [][]PlanStat
 
 // todo: 改成并发的
-func plan(newKeys []uint64) []FlushPlan {
+func planStep1(newKeys []uint64) []FlushPlan {
 	ret := make([]FlushPlan, 0, 256)
 	planStatThisRound := make([]PlanStat, 0, len(pmtinternal.PartIdx))
 	for _, p := range pmtinternal.PartIdx {
@@ -60,7 +60,7 @@ func plan(newKeys []uint64) []FlushPlan {
 		for i := len(sp.Stack) - 1; i >= 0; i-- {
 			info, ok := pmtinternal.SstMap[uint64(sp.Stack[i])]
 			if !ok {
-				panic(fmt.Sprintf("plan: file %d not found in SstMap", sp.Stack[i]))
+				panic(fmt.Sprintf("planStep1: file %d not found in SstMap", sp.Stack[i]))
 			}
 			nextFilePages := int(info.Size / PageSize)
 			if float64(rewritePages+nextFilePages) > threshold {
@@ -82,7 +82,7 @@ func plan(newKeys []uint64) []FlushPlan {
 		for _, fn := range sp.Stack {
 			info, ok := pmtinternal.SstMap[uint64(fn)]
 			if !ok {
-				panic(fmt.Sprintf("plan snapshot: file %d not found in SstMap", fn))
+				panic(fmt.Sprintf("planStep1 snapshot: file %d not found in SstMap", fn))
 			}
 			stack = append(stack, info.Size/uint64(PageSize))
 		}
@@ -96,12 +96,12 @@ func plan(newKeys []uint64) []FlushPlan {
 		})
 		ret = append(ret, sp)
 	}
-	planHistory = append(planHistory, planStatThisRound)
+	planHistoryList = append(planHistoryList, planStatThisRound)
 	return ret
 }
 
 var mergeCt = 0 // 用来观察, 暂时放在外面, 以后也许..
-func mergePlan(list []FlushPlan) []FlushPlan {
+func passiveMergePlan(list []FlushPlan) []FlushPlan {
 	if len(list) < 2 {
 		return list
 	}
@@ -129,19 +129,19 @@ func mergePlan(list []FlushPlan) []FlushPlan {
 	return merged
 }
 
-func dumpPlanHistory(startFrom int, path string) {
+func dumpFlushHistory(startFrom int, path string) {
 	if err := os.MkdirAll(path, 0755); err != nil {
 		panic(err)
 	}
-	if startFrom > len(planHistory) {
-		panic("startFrom > len(planHistory)")
+	if startFrom > len(planHistoryList) {
+		panic("startFrom > len(planHistoryList)")
 	}
-	for flushID := startFrom; flushID < len(planHistory); flushID++ {
+	for flushID := startFrom; flushID < len(planHistoryList); flushID++ {
 		f, err := os.Create(filepath.Join(path, fmt.Sprintf("flush_%06d.plan", flushID)))
 		if err != nil {
 			panic(err)
 		}
-		for _, e := range planHistory[flushID] {
+		for _, e := range planHistoryList[flushID] {
 			_, err := f.WriteString(fmt.Sprintf(
 				"# part:[%d,%d], newPages:%d, writeTo:%d, stack: %s, reason: %s\n",
 				e.PartLow, e.PartHigh, e.NewPages, e.WriteTo, formatPlanStack(e.Stack), e.Reason,

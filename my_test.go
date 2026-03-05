@@ -119,7 +119,7 @@ func Test_pmt_basic(t *testing.T) {
 	d := LoadDataFile(path)
 	keys := d.Keys
 
-	spList := plan(keys)
+	spList := planStep1(keys)
 	multilevelFlushConcurrent(db, keys, uint64(17), spList, 2)
 	pmtinternal.PartIdx = newPartIdxFrom(spList)
 
@@ -537,8 +537,8 @@ func Test_pmt_wa(t *testing.T) {
 	writeStart := time.Now()
 	for i := 0; i < times; i++ {
 		keys := datas[i<<20 : (i+1)<<20]
-		pList := plan(keys)
-		pList = mergePlan(pList) // current testing
+		pList := planStep1(keys)
+		pList = passiveMergePlan(pList) // current testing
 
 		//for j, sp := range pList {
 		//	mem := fakeMemTable{
@@ -553,7 +553,7 @@ func Test_pmt_wa(t *testing.T) {
 	}
 	println(fmt.Sprintf("写入阶段耗时(ms): %d", time.Since(writeStart).Milliseconds()))
 
-	//dumpPlanHistory(62, "w_flushhistory")
+	//dumpFlushHistory(62, "w_flushhistory")
 
 	metrics := stat(db)
 	use(metrics)
@@ -1102,7 +1102,7 @@ func Test_multilevelFlush_pprof(t *testing.T) {
 	for r := 0; r < rounds; r++ {
 		path := filepath.Join(dir, fmt.Sprintf("normal_plus_round_%03d.bin", r))
 		d := LoadDataFile(path)
-		spList := plan(d.Keys)
+		spList := planStep1(d.Keys)
 		multilevelFlushConcurrent(db, d.Keys, uint64(r), spList, flushConcurrency)
 		pmtinternal.PartIdx = newPartIdxFrom(spList)
 	}
