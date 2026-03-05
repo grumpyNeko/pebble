@@ -25,29 +25,24 @@ type PlanStat struct {
 	PartHigh uint64
 	NewPages int
 	WriteTo  uint16
-	Stack    []FileNum
+	Stack    []uint64 // file size in page
 	Reason   string
 }
 
 var planHistory [][]PlanStat
 
-func plan(newKeys []uint64) []SubPart {
-	ret := make([]SubPart, 0, 256)
-	onePlan := make([]PlanStat, 0, len(pmtinternal.PartIdx))
+// todo: 改成并发的
+func plan(newKeys []uint64) []FlushPlan {
+	ret := make([]FlushPlan, 0, 256)
+	planStatThisRound := make([]PlanStat, 0, len(pmtinternal.PartIdx))
 	for _, p := range pmtinternal.PartIdx {
-		sp := SubPart{
+		sp := FlushPlan{
 			High:    p.High,
 			low:     p.Low,
 			WriteTo: uint16(len(p.Stack)),
 			Stack:   p.Stack,
 			Outputs: nil,
 		}
-
-		// old plan (kept as requested):
-		// if len(sp.Stack) > 6 {
-		// 	println("len(sp.Stack) > 6")
-		// 	sp.WriteTo = 0
-		// }
 
 		newKVCount := len(rangeLimit(newKeys, sp.low, sp.High))
 		newPages := newKVCount / KVPerPage
@@ -83,65 +78,58 @@ func plan(newKeys []uint64) []SubPart {
 			panic("writeTo >= MaxStackLen")
 		}
 		sp.WriteTo = uint16(writeTo)
-		onePlan = append(onePlan, PlanStat{
+		stack := make([]uint64, 0, len(sp.Stack))
+		for _, fn := range sp.Stack {
+			info, ok := pmtinternal.SstMap[uint64(fn)]
+			if !ok {
+				panic(fmt.Sprintf("plan snapshot: file %d not found in SstMap", fn))
+			}
+			stack = append(stack, info.Size/uint64(PageSize))
+		}
+		planStatThisRound = append(planStatThisRound, PlanStat{
 			PartLow:  sp.low,
 			PartHigh: sp.High,
 			NewPages: newPages,
 			WriteTo:  sp.WriteTo,
-			Stack:    append([]FileNum(nil), sp.Stack...),
+			Stack:    stack,
 			Reason:   reason,
 		})
 		ret = append(ret, sp)
 	}
-	planHistory = append(planHistory, onePlan)
+	planHistory = append(planHistory, planStatThisRound)
 	return ret
 }
 
-func mergePlan(list []SubPart) []SubPart {
-	if len(list) == 0 {
+var mergeCt = 0 // 用来观察, 暂时放在外面, 以后也许..
+func mergePlan(list []FlushPlan) []FlushPlan {
+	if len(list) < 2 {
 		return list
 	}
-	merged := make([]SubPart, 0, len(list))
-	for i := 0; i < len(list); i++ {
+
+	merged := make([]FlushPlan, 0, len(list))
+	for i := 0; i < len(list); { // 双指针
 		cur := list[i]
 		if cur.WriteTo != 0 {
 			merged = append(merged, cur)
+			i++
 			continue
 		}
-		seen := make(map[FileNum]struct{}, len(cur.Stack))
-		for _, f := range cur.Stack {
-			seen[f] = struct{}{}
-		}
-		for i+1 < len(list) && list[i+1].WriteTo == 0 {
-			next := list[i+1]
-			if cur.High == math.MaxUint64 {
-				panic("mergePlan: found next subpart after MaxUint64")
-			}
-			if next.low != cur.High+1 {
-				panic(fmt.Sprintf("mergePlan: non-adjacent range [%d,%d] then [%d,%d]", cur.low, cur.High, next.low, next.High))
-			}
+		j := i + 1
+		for ; j < len(list) && list[j].WriteTo == 0; j++ {
+			next := list[j]
+			// no need to check keyrange
 			cur.High = next.High
-			for _, f := range next.Stack {
-				if _, ok := seen[f]; ok {
-					continue
-				}
-				seen[f] = struct{}{}
-				cur.Stack = append(cur.Stack, f)
-			}
-			i++
+			cur.Stack = append(cur.Stack, next.Stack...)
+
+			mergeCt++
 		}
 		merged = append(merged, cur)
+		i = j
 	}
 	return merged
 }
 
 func dumpPlanHistory(startFrom int, path string) {
-	if startFrom < 0 {
-		panic("startFrom < 0")
-	}
-	if path == "" {
-		panic("path is empty")
-	}
 	if err := os.MkdirAll(path, 0755); err != nil {
 		panic(err)
 	}
@@ -170,7 +158,7 @@ func dumpPlanHistory(startFrom int, path string) {
 }
 
 // [1000,500,155,100]
-func formatPlanStack(stack []FileNum) string {
+func formatPlanStack(stack []uint64) string {
 	if len(stack) == 0 {
 		return "[]"
 	}
@@ -180,47 +168,51 @@ func formatPlanStack(stack []FileNum) string {
 		if i > 0 {
 			b.WriteString(",")
 		}
-		info, ok := pmtinternal.SstMap[uint64(f)]
-		if !ok {
-			panic(fmt.Sprintf("formatPlanStack: file %d not found in SstMap", f))
-		}
-		b.WriteString(fmt.Sprintf("%d", info.Size/uint64(PageSize)))
+		b.WriteString(fmt.Sprintf("%d", f))
 	}
 	b.WriteString("]")
 	return b.String()
 }
 
-type SubPart struct {
+type FlushPlan struct {
 	High    uint64
 	low     uint64 // what use?
-	WriteTo uint16 // 0 means write base, n means merge Stack[n,]
+	WriteTo uint16 // 0 means rewrite all, stack.len means just flush no rewrite
 	Stack   []FileNum
 	Outputs []uint64
 }
 
-func newPartIdxFrom(spList []SubPart) []pmtinternal.Part {
-	var parts []pmtinternal.Part
-	for i, e := range pmtinternal.PartIdx {
-		// Sentinel part has no corresponding SubPart entry.
-		if i >= len(spList) {
-			parts = append(parts, e)
+func newPartIdxFrom(pList []FlushPlan) []pmtinternal.Part {
+	ret := make([]pmtinternal.Part, 0, len(pList))
+	nextLow := uint64(0)
+	for _, p := range pList {
+		if int(p.WriteTo) > len(p.Stack) {
+			panic("p.WriteTo > len(p.Stack)")
+		}
+		if p.low < nextLow {
+			panic("p.low < nextLow")
+		}
+		if len(p.Outputs) == 0 && p.WriteTo == 0 {
+			// delete part: keep nextLow unchanged so following parts absorb this range.
 			continue
 		}
-		sp := spList[i]
-		outs := append([]uint64(nil), sp.Outputs...)
-		sort.Slice(outs, func(i, j int) bool {
-			return pmtinternal.SstMap[outs[i]].Largest < pmtinternal.SstMap[outs[j]].Largest
-		})
-		prefix := e.Stack[:int(sp.WriteTo)]
-		if len(outs) == 0 {
-			parts = append(parts, e)
-			continue
-		}
-		if len(prefix) == 0 { // split part by outputs
-			currentLow := e.Low
+		if p.WriteTo == 0 {
+			outs := append([]uint64(nil), p.Outputs...)
+			for _, fn := range outs {
+				if _, ok := pmtinternal.SstMap[fn]; !ok {
+					panic(fmt.Sprintf("newPartIdxFrom: output file %d not found in SstMap", fn))
+				}
+			}
+			sort.Slice(outs, func(i, j int) bool {
+				return pmtinternal.SstMap[outs[i]].Largest < pmtinternal.SstMap[outs[j]].Largest
+			})
+			currentLow := nextLow
 			for _, fn := range outs {
 				info := pmtinternal.SstMap[fn]
-				parts = append(parts, pmtinternal.Part{
+				if info.Largest < currentLow {
+					panic("info.Largest < currentLow")
+				}
+				ret = append(ret, pmtinternal.Part{
 					Low:   currentLow,
 					High:  info.Largest,
 					Stack: []base.FileNum{base.FileNum(fn)},
@@ -228,26 +220,35 @@ func newPartIdxFrom(spList []SubPart) []pmtinternal.Part {
 				})
 				currentLow = info.Largest + 1
 			}
+			nextLow = currentLow
 			continue
 		}
-		// append outs to prefix stack
-		newStack := append([]base.FileNum{}, prefix...)
-		for _, fn := range outs {
+
+		newStack := append([]base.FileNum{}, p.Stack[:int(p.WriteTo)]...)
+		for _, fn := range p.Outputs {
 			newStack = append(newStack, base.FileNum(fn))
 		}
-		parts = append(parts, pmtinternal.Part{
-			Low:   e.Low,
-			High:  e.High,
+		ret = append(ret, pmtinternal.Part{
+			Low:   nextLow,
+			High:  p.High,
 			Stack: newStack,
 			Tmp:   nil,
 		})
+		if p.High != math.MaxUint64 {
+			nextLow = p.High + 1
+		}
 	}
-	n := len(parts)
-	if n == 0 {
-		panic("why len(newPartIdxFrom) == 0")
+	if len(ret) == 0 {
+		ret = append(ret, pmtinternal.Part{
+			Low:   0,
+			High:  math.MaxUint64,
+			Stack: nil,
+			Tmp:   nil,
+		})
+		return ret
 	}
-	if parts[n-1].High != math.MaxUint64 {
-		parts = append(parts, pmtinternal.Part{Low: parts[n-1].High + 1, High: math.MaxUint64})
+	if ret[len(ret)-1].High != math.MaxUint64 {
+		ret[len(ret)-1].High = math.MaxUint64
 	}
-	return parts
+	return ret
 }

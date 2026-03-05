@@ -5,6 +5,35 @@
 每个Part都是{key,files,..}
 用SstMap记录SST的 (Smallest,Largest,Size)
 
+# newPartIdxFrom
+``` 
+newPartIdxFrom(pList) []Part {
+	ret = []
+	for p in pList
+	  continue if p.Outputs == 0 && p.WriteTo == 0 
+    if p.WriteTo == 0 // split old part, one newPart for one output
+      sort p.Outputs
+      for f in p.Outputs
+        ret += {..}
+    else 
+      ret += {
+      	Low:   p.Low,
+				High:  p.High,
+				Stack: p.Stack[:p.WriteTo] + p.Outputs,
+      }
+  // last part is sentinel
+	if ret.len == 0 
+		ret += Part{
+			Low:   0,
+			High:  MaxUint64,
+			Stack: nil,
+		})
+	if ret[-1].High != MaxUint64 
+    ret[-1].High = MaxUint64
+  return ret 
+}
+```
+
 # 修改OutputSplitter
 原来, 依据grandparent-overlap
 现在, 依据区间边界

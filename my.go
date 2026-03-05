@@ -188,7 +188,6 @@ func CompactionEnd(info CompactionInfo) {
 	if !pmtinternal.EnablePMT {
 		return
 	}
-
 	inputs := []manifest.TableInfo{}
 	for _, l := range info.Input {
 		for _, sst := range l.Tables {
@@ -207,10 +206,6 @@ func CompactionEnd(info CompactionInfo) {
 			Largest:  binary.BigEndian.Uint64(e.Largest.UserKey),
 		})
 	}
-	for _, e := range inputs {
-		pmtinternal.RemoveFromMap(uint64(e.FileNum))
-	}
-
 	// Store results in the global map indexed by jobID
 	compactionResultsMu.Lock()
 	compactionResults[JobID(info.JobID)] = outputs
@@ -296,10 +291,11 @@ func newPartIdx(inputs []manifest.TableInfo, outputs []manifest.TableInfo) (part
 	return
 }
 
+// IMPORTANT, pmt的multilevelFlush走CompactionEnd，不FlushEnd
 func FlushEnd(info FlushInfo) {
 	println(fmt.Sprintf("FlushEnd %v", info))
-	if !pmtinternal.EnablePMT {
-		return
+	if pmtinternal.EnablePMT {
+		panic("why")
 	}
 
 	outputs := []manifest.TableInfo{}
@@ -1133,20 +1129,19 @@ func multilevelFlushWithResult(db *DB, mem fakeMemTable, files []base.FileNum, o
 		panic(`outputLevel < 0`)
 	}
 	jobID := multilevelFlush(db, mem, files, outputLevel)
+	if jobID == -1 {
+		return nil
+	}
 
 	// Retrieve results from the map using jobID
 	compactionResultsMu.Lock()
 	outputs, ok := compactionResults[jobID]
-	if ok {
-		// Delete the map entry after retrieval
-		delete(compactionResults, jobID)
-	}
-	compactionResultsMu.Unlock()
-
 	if !ok {
-		// No results found for this jobID
-		return nil
+		panic(fmt.Sprintf("compactionResults[%d] not found", jobID))
 	}
+	// Delete map entry after retrieval
+	delete(compactionResults, jobID)
+	compactionResultsMu.Unlock()
 
 	var nums []uint64
 	for _, t := range outputs {
