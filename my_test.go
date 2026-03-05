@@ -963,26 +963,6 @@ func Test_make_sst(t *testing.T) {
 	use(meta)
 }
 
-// 放进指定level，触发multilevel compact
-func Test_MustIngestToLevel(t *testing.T) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		panic("")
-	}
-	println(cwd)
-
-	db := MustDB("test-db", true)
-	MustIngestToLevel(db, "tmp", "a0", 0)
-	MustIngestToLevel(db, "tmp", "a1", 1)
-	MustIngestToLevel(db, "tmp", "a2", 2)
-	MustIngestToLevel(db, "tmp", "a3", 3)
-	printKeys(db)
-	m := stat(db)
-	db.MyCompact(BigEndian(0), BigEndian(100), 1)
-	m = stat(db)
-	use(m)
-}
-
 // bypass plan
 func Test_multilevelFlush(t *testing.T) {
 	db := MustDB("test-db", true)
@@ -1127,14 +1107,6 @@ func Test_multilevelFlush_pprof(t *testing.T) {
 		pmtinternal.PartIdx = newPartIdxFrom(spList)
 	}
 	t.Logf("pprof cpu profile written to %s", profPath)
-}
-
-func MustIngestToLevel(db *DB, dir string, name string, level int) {
-	tmp := vfs.Default.PathJoin(dir, name)
-	_, err := db.ingest0(context.TODO(), []string{tmp}, nil /* shared */, KeyRange{}, nil, level)
-	if err != nil {
-		panic(err)
-	}
 }
 
 // 有多少碎片文件

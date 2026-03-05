@@ -585,16 +585,6 @@ func (d *DB) pmtGetFromFile(meta *tableMetadata, k uint64) (uint64, bool) {
 	return binary.BigEndian.Uint64(v), true
 }
 
-func printKeys(db *DB) {
-	iter, err := db.NewIter(&IterOptions{})
-	if err != nil {
-		panic(err)
-	}
-	for iter.First(); iter.Valid(); iter.Next() {
-		println(binary.BigEndian.Uint64(iter.Key()))
-	}
-}
-
 type myAlwaysMultiLevel struct{}
 
 func (d myAlwaysMultiLevel) pick(
