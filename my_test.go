@@ -119,9 +119,9 @@ func Test_pmt_basic(t *testing.T) {
 	d := LoadDataFile(path)
 	keys := d.Keys
 
-	spList := planStep1(keys)
-	multilevelFlushConcurrent(db, keys, uint64(17), spList, 2)
-	pmtinternal.PartIdx = newPartIdxFrom(spList)
+	flushPlan := planStep1(keys)
+	multilevelFlushConcurrent(db, keys, uint64(17), flushPlan.planList, 2)
+	pmtinternal.PartIdx = newPartIdxFrom(flushPlan.planList)
 
 	metrics := db.Metrics()
 	if len(pmtinternal.PartIdx) == 0 {
@@ -527,7 +527,7 @@ func Test_pmt_wa(t *testing.T) {
 	})
 
 	const flushConcurrency = 4
-	times := 64 // 128
+	times := 128 // 128
 	datas := make([]uint64, 0, times<<20)
 	for i := 0; i < times; i++ {
 		path := filepath.Join("pmttestdata", fmt.Sprintf("normal_plus_round_%03d.bin", i))
@@ -537,8 +537,8 @@ func Test_pmt_wa(t *testing.T) {
 	writeStart := time.Now()
 	for i := 0; i < times; i++ {
 		keys := datas[i<<20 : (i+1)<<20]
-		pList := planStep1(keys)
-		pList = passiveMergePlan(pList) // current testing
+		flushPlan := planStep1(keys)
+		flushPlan = passiveMergePlan(flushPlan) // current testing
 
 		//for j, sp := range pList {
 		//	mem := fakeMemTable{
@@ -547,8 +547,8 @@ func Test_pmt_wa(t *testing.T) {
 		//	}
 		//	pList[j].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], int(manifest.NumLevels-1-sp.WriteTo))
 		//}
-		multilevelFlushConcurrent(db, keys, uint64(i), pList, flushConcurrency)
-		pmtinternal.PartIdx = newPartIdxFrom(pList) // TODO: 不是通过CompactionEnd/FlushEnd更新PartIdx
+		multilevelFlushConcurrent(db, keys, uint64(i), flushPlan.planList, flushConcurrency)
+		pmtinternal.PartIdx = newPartIdxFrom(flushPlan.planList) // TODO: 不是通过CompactionEnd/FlushEnd更新PartIdx
 		println(fmt.Sprintf("done %d", i))
 	}
 	println(fmt.Sprintf("写入阶段耗时(ms): %d", time.Since(writeStart).Milliseconds()))
@@ -557,7 +557,7 @@ func Test_pmt_wa(t *testing.T) {
 
 	metrics := stat(db)
 	use(metrics)
-	partStat()
+	printPartStat()
 	println(mergeCt)
 	// ------------------------------
 	// disk 128pagescache nocompression 128round, 0.129ms
@@ -621,7 +621,7 @@ func Test_pmt_wa(t *testing.T) {
 	//random read cost 45203ms
 }
 
-func partStat() {
+func printPartStat() {
 	const (
 		smallFileThreshold = uint64(4 * PageSize)
 		smallPartThreshold = uint64(512 * PageSize)
@@ -639,7 +639,7 @@ func partStat() {
 		for _, fileNum := range part.Stack {
 			info, ok := pmtinternal.SstMap[uint64(fileNum)]
 			if !ok {
-				panic(fmt.Sprintf("partStat: file %d not found in SstMap", fileNum))
+				panic(fmt.Sprintf("printPartStat: file %d not found in SstMap", fileNum))
 			}
 			partSize += info.Size
 			fileCount++
@@ -843,7 +843,7 @@ func Test_gen_data(t *testing.T) {
 	}
 }
 
-func multilevelFlushConcurrent(db *DB, keys []uint64, v uint64, spList []FlushPlan, concurrency int) {
+func multilevelFlushConcurrent(db *DB, keys []uint64, v uint64, spList []PartPlan, concurrency int) {
 	if len(spList) == 0 {
 		return
 	}
@@ -869,7 +869,7 @@ func multilevelFlushConcurrent(db *DB, keys []uint64, v uint64, spList []FlushPl
 		}
 		list := spList[start:end]
 		wg.Add(1)
-		go func(list []FlushPlan) {
+		go func(list []PartPlan) {
 			defer wg.Done()
 			for i := range list {
 				sp := list[i]
@@ -967,8 +967,8 @@ func Test_make_sst(t *testing.T) {
 func Test_multilevelFlush(t *testing.T) {
 	db := MustDB("test-db", true)
 
-	spList := []FlushPlan{
-		FlushPlan{
+	pList := []PartPlan{
+		PartPlan{
 			High:    math.MaxUint64,
 			low:     0,
 			WriteTo: 0,
@@ -977,25 +977,25 @@ func Test_multilevelFlush(t *testing.T) {
 		},
 	}
 	keys := []uint64{0, 20}
-	for i, sp := range spList {
+	for i, sp := range pList {
 		mem := fakeMemTable{
 			keys: rangeLimit(keys, sp.low, sp.High),
 			v:    1,
 		}
-		spList[i].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], outputLevelForWriteTo(sp.WriteTo))
+		pList[i].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], outputLevelForWriteTo(sp.WriteTo))
 	}
-	pmtinternal.PartIdx = newPartIdxFrom(spList)
+	pmtinternal.PartIdx = newPartIdxFrom(pList)
 	println(db.LSMViewURL())
 
-	spList = []FlushPlan{
-		FlushPlan{
+	pList = []PartPlan{
+		PartPlan{
 			High:    20,
 			low:     0,
 			WriteTo: 0,
 			Stack:   []FileNum{4},
 			Outputs: nil,
 		},
-		FlushPlan{
+		PartPlan{
 			High:    math.MaxUint64,
 			low:     21,
 			WriteTo: 0,
@@ -1004,32 +1004,32 @@ func Test_multilevelFlush(t *testing.T) {
 		},
 	}
 	keys = []uint64{1, 2, 32}
-	for i, sp := range spList {
+	for i, sp := range pList {
 		mem := fakeMemTable{
 			keys: rangeLimit(keys, sp.low, sp.High),
 			v:    2,
 		}
-		spList[i].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], outputLevelForWriteTo(sp.WriteTo))
+		pList[i].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], outputLevelForWriteTo(sp.WriteTo))
 	}
-	pmtinternal.PartIdx = newPartIdxFrom(spList)
+	pmtinternal.PartIdx = newPartIdxFrom(pList)
 	println(db.LSMViewURL())
 
-	spList = []FlushPlan{
-		FlushPlan{
+	pList = []PartPlan{
+		PartPlan{
 			High:    20,
 			low:     0,
 			WriteTo: 1,
 			Stack:   []FileNum{5},
 			Outputs: nil,
 		},
-		FlushPlan{
+		PartPlan{
 			High:    32,
 			low:     21,
 			WriteTo: 1,
 			Stack:   []FileNum{6},
 			Outputs: nil,
 		},
-		FlushPlan{
+		PartPlan{
 			High:    math.MaxUint64,
 			low:     33,
 			WriteTo: 0,
@@ -1038,14 +1038,14 @@ func Test_multilevelFlush(t *testing.T) {
 		},
 	}
 	keys = []uint64{16, 32}
-	for i, sp := range spList {
+	for i, sp := range pList {
 		mem := fakeMemTable{
 			keys: rangeLimit(keys, sp.low, sp.High),
 			v:    3,
 		}
-		spList[i].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], outputLevelForWriteTo(sp.WriteTo))
+		pList[i].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], outputLevelForWriteTo(sp.WriteTo))
 	}
-	pmtinternal.PartIdx = newPartIdxFrom(spList)
+	pmtinternal.PartIdx = newPartIdxFrom(pList)
 	println(db.LSMViewURL())
 	use(pmtinternal.PartIdx)
 }
@@ -1102,9 +1102,9 @@ func Test_multilevelFlush_pprof(t *testing.T) {
 	for r := 0; r < rounds; r++ {
 		path := filepath.Join(dir, fmt.Sprintf("normal_plus_round_%03d.bin", r))
 		d := LoadDataFile(path)
-		spList := planStep1(d.Keys)
-		multilevelFlushConcurrent(db, d.Keys, uint64(r), spList, flushConcurrency)
-		pmtinternal.PartIdx = newPartIdxFrom(spList)
+		flushPlan := planStep1(d.Keys)
+		multilevelFlushConcurrent(db, d.Keys, uint64(r), flushPlan.planList, flushConcurrency)
+		pmtinternal.PartIdx = newPartIdxFrom(flushPlan.planList)
 	}
 	t.Logf("pprof cpu profile written to %s", profPath)
 }

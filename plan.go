@@ -20,7 +20,7 @@ const (
 	MaxStackLen          = 7
 )
 
-type PlanStat struct {
+type PartPlanStat struct {
 	PartLow  uint64
 	PartHigh uint64
 	NewPages int
@@ -29,14 +29,23 @@ type PlanStat struct {
 	Reason   string
 }
 
-var planHistoryList [][]PlanStat
+type FlushPlanStat struct {
+	plans []PartPlanStat
+}
+
+var flushHistory []FlushPlanStat
+
+type FlushPlan struct {
+	planList []PartPlan
+}
 
 // todo: 改成并发的
-func planStep1(newKeys []uint64) []FlushPlan {
-	ret := make([]FlushPlan, 0, 256)
-	planStatThisRound := make([]PlanStat, 0, len(pmtinternal.PartIdx))
+func planStep1(newKeys []uint64) FlushPlan {
+	pList := make([]PartPlan, 0, 256)
+
+	tmp := make([]PartPlanStat, 0, len(pmtinternal.PartIdx))
 	for _, p := range pmtinternal.PartIdx {
-		sp := FlushPlan{
+		sp := PartPlan{
 			High:    p.High,
 			low:     p.Low,
 			WriteTo: uint16(len(p.Stack)),
@@ -86,7 +95,7 @@ func planStep1(newKeys []uint64) []FlushPlan {
 			}
 			stack = append(stack, info.Size/uint64(PageSize))
 		}
-		planStatThisRound = append(planStatThisRound, PlanStat{
+		tmp = append(tmp, PartPlanStat{
 			PartLow:  sp.low,
 			PartHigh: sp.High,
 			NewPages: newPages,
@@ -94,29 +103,30 @@ func planStep1(newKeys []uint64) []FlushPlan {
 			Stack:    stack,
 			Reason:   reason,
 		})
-		ret = append(ret, sp)
+		pList = append(pList, sp)
 	}
-	planHistoryList = append(planHistoryList, planStatThisRound)
-	return ret
+
+	flushHistory = append(flushHistory, FlushPlanStat{plans: tmp})
+	return FlushPlan{planList: pList}
 }
 
 var mergeCt = 0 // 用来观察, 暂时放在外面, 以后也许..
-func passiveMergePlan(list []FlushPlan) []FlushPlan {
-	if len(list) < 2 {
-		return list
+func passiveMergePlan(flushPlan FlushPlan) FlushPlan {
+	if len(flushPlan.planList) < 2 {
+		return flushPlan
 	}
 
-	merged := make([]FlushPlan, 0, len(list))
-	for i := 0; i < len(list); { // 双指针
-		cur := list[i]
+	merged := make([]PartPlan, 0, len(flushPlan.planList))
+	for i := 0; i < len(flushPlan.planList); { // 双指针
+		cur := flushPlan.planList[i]
 		if cur.WriteTo != 0 {
 			merged = append(merged, cur)
 			i++
 			continue
 		}
 		j := i + 1
-		for ; j < len(list) && list[j].WriteTo == 0; j++ {
-			next := list[j]
+		for ; j < len(flushPlan.planList) && flushPlan.planList[j].WriteTo == 0; j++ {
+			next := flushPlan.planList[j]
 			// no need to check keyrange
 			cur.High = next.High
 			cur.Stack = append(cur.Stack, next.Stack...)
@@ -126,22 +136,27 @@ func passiveMergePlan(list []FlushPlan) []FlushPlan {
 		merged = append(merged, cur)
 		i = j
 	}
-	return merged
+	return FlushPlan{planList: merged}
+}
+
+func activeMergePlan(list []PartPlan) []PartPlan {
+	// todo: ...
+	return nil
 }
 
 func dumpFlushHistory(startFrom int, path string) {
 	if err := os.MkdirAll(path, 0755); err != nil {
 		panic(err)
 	}
-	if startFrom > len(planHistoryList) {
-		panic("startFrom > len(planHistoryList)")
+	if startFrom > len(flushHistory) {
+		panic("startFrom > len(flushHistory)")
 	}
-	for flushID := startFrom; flushID < len(planHistoryList); flushID++ {
+	for flushID := startFrom; flushID < len(flushHistory); flushID++ {
 		f, err := os.Create(filepath.Join(path, fmt.Sprintf("flush_%06d.plan", flushID)))
 		if err != nil {
 			panic(err)
 		}
-		for _, e := range planHistoryList[flushID] {
+		for _, e := range flushHistory[flushID].plans {
 			_, err := f.WriteString(fmt.Sprintf(
 				"# part:[%d,%d], newPages:%d, writeTo:%d, stack: %s, reason: %s\n",
 				e.PartLow, e.PartHigh, e.NewPages, e.WriteTo, formatPlanStack(e.Stack), e.Reason,
@@ -174,7 +189,7 @@ func formatPlanStack(stack []uint64) string {
 	return b.String()
 }
 
-type FlushPlan struct {
+type PartPlan struct {
 	High    uint64
 	low     uint64 // what use?
 	WriteTo uint16 // 0 means rewrite all, stack.len means just flush no rewrite
@@ -182,7 +197,7 @@ type FlushPlan struct {
 	Outputs []uint64
 }
 
-func newPartIdxFrom(pList []FlushPlan) []pmtinternal.Part {
+func newPartIdxFrom(pList []PartPlan) []pmtinternal.Part {
 	ret := make([]pmtinternal.Part, 0, len(pList))
 	nextLow := uint64(0)
 	for _, p := range pList {
