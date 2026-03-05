@@ -1,11 +1,6 @@
-pmt是在pebble基础上的增强: 全局划分, 多层刷盘, ...
-不要这里改一下那里改一下, 新逻辑要集中:
-  用goto跳过逻辑
-  pmtstate.go
 
-  
 
-- 增加Part和PartIdx
+# Part和PartIdx
 把键范围切成若干Part
 每个Part都是{key,files,..}
 用SstMap记录SST的 (Smallest,Largest,Size)

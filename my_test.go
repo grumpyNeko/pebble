@@ -119,9 +119,9 @@ func Test_pmt_basic(t *testing.T) {
 	d := LoadDataFile(path)
 	keys := d.Keys
 
-	spList := plan()
+	spList := plan(keys)
 	multilevelFlushConcurrent(db, keys, uint64(17), spList, 2)
-	pmtinternal.PartIdx = newPartIdxFromSubParts(spList)
+	pmtinternal.PartIdx = newPartIdxFrom(spList)
 
 	metrics := db.Metrics()
 	if len(pmtinternal.PartIdx) == 0 {
@@ -396,10 +396,10 @@ func Test_pebble_wa(t *testing.T) {
 	}
 	println(fmt.Sprintf("等待压实耗时(ms): %d", time.Since(compactWaitStart).Milliseconds()))
 
-	//metrics := stat(db)
-	//use(metrics)
-	//use(pmtinternal.PartIdx)
-	//println(metrics.Total().BytesIn)
+	metrics := stat(db)
+	use(metrics)
+	use(pmtinternal.PartIdx)
+	println(fmt.Sprintf("total bytes in: %d", metrics.Total().BytesIn))
 
 	//avg(db)
 	benchmarkRandomReadMultiThread(datas, db, 1)
@@ -509,9 +509,7 @@ func Test_pebble_r(t *testing.T) {
 
 // normal_plus
 // 64, 写耗时: 84448,81142,97571=>687.79 Kops; 点读耗时=
-// 128, 写耗时: 195638,269629,312484,276104,225041=>596.42 Kops; 点读耗时={512page, 522201ms}
-
-// normal_plus, 128,
+// 128, 写耗时: 195638,269629,312484,276104,225041=>596.42 Kops
 func Test_pmt_wa(t *testing.T) {
 	println(fmt.Sprintf("GOMAXPROCS=%d", runtime.GOMAXPROCS(0)))
 	db := MustDB("mybench_pmt", true, func(options *Options) *Options {
@@ -521,15 +519,15 @@ func Test_pmt_wa(t *testing.T) {
 		options.FileFormat = sstable.TableFormatPMT0
 		//options.FileFormat = sstable.TableFormatPebblev6
 
-		pagesize := 4 << 10                       // 4KB
-		options.CacheSize = int64(512 * pagesize) //
+		pagesize := 4 << 10                             // 4KB
+		options.CacheSize = int64(1024 * 16 * pagesize) //
 		options.DisableAutomaticCompactions = true
 		options.MaxConcurrentCompactions = func() int { return 8 }
 		return options
 	})
 
 	const flushConcurrency = 4
-	times := 128 // 128
+	times := 64 // 128
 	datas := make([]uint64, 0, times<<20)
 	for i := 0; i < times; i++ {
 		path := filepath.Join("pmttestdata", fmt.Sprintf("normal_plus_round_%03d.bin", i))
@@ -539,7 +537,7 @@ func Test_pmt_wa(t *testing.T) {
 	writeStart := time.Now()
 	for i := 0; i < times; i++ {
 		keys := datas[i<<20 : (i+1)<<20]
-		spList := plan()
+		spList := plan(keys)
 		//for j, sp := range spList {
 		//	mem := fakeMemTable{
 		//		keys: rangeLimit(d.Keys, sp.low, sp.High),
@@ -548,20 +546,18 @@ func Test_pmt_wa(t *testing.T) {
 		//	spList[j].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], int(manifest.NumLevels-1-sp.WriteTo))
 		//}
 		multilevelFlushConcurrent(db, keys, uint64(i), spList, flushConcurrency)
-		pmtinternal.PartIdx = newPartIdxFromSubParts(spList) // TODO: 不是通过CompactionEnd/FlushEnd更新PartIdx
+		pmtinternal.PartIdx = newPartIdxFrom(spList) // TODO: 不是通过CompactionEnd/FlushEnd更新PartIdx
 		println(fmt.Sprintf("done %d", i))
 	}
 	println(fmt.Sprintf("写入阶段耗时(ms): %d", time.Since(writeStart).Milliseconds()))
 
-	//metrics := stat(db)
-	//use(metrics)
-	//use(pmtinternal.PartIdx)
-	//println(metrics.Total().BytesIn)
+	dumpPlanHistory(62, "flush history")
+	metrics := stat(db)
+	use(metrics)
+	use(pmtinternal.PartIdx)
+	println(fmt.Sprintf("total bytes in: %d", metrics.Total().BytesIn))
 
 	// ------------------------------
-
-	//avg(db)
-
 	// --- get every key ---
 	//	db := MustDB(EnablePebble, func(options *Options) *Options {
 	//		options.FS = vfs.Default
@@ -581,15 +577,16 @@ func Test_pmt_wa(t *testing.T) {
 	// pmt 256pagescache nocompression 128round, 47.1us
 	//benchmarkRandomRead(datas, db)
 
-	benchmarkRandomReadMultiThread(datas, db, 1)
-	benchmarkRandomReadMultiThread(datas, db, 4)
-	benchmarkRandomReadMultiThread(datas, db, 8)
-	benchmarkRandomReadMultiThread(datas, db, 12)
-	benchmarkRandomReadMultiThread(datas, db, 16)
-	benchmarkRandomReadMultiThread(datas, db, 24)
-	benchmarkRandomReadMultiThread(datas, db, 32)
-	benchmarkRandomReadMultiThread(datas, db, 48)
-	benchmarkRandomReadMultiThread(datas, db, 64)
+	//benchmarkRandomReadMultiThread(datas, db, 1)
+	//benchmarkRandomReadMultiThread(datas, db, 4)
+	//benchmarkRandomReadMultiThread(datas, db, 8)
+	//benchmarkRandomReadMultiThread(datas, db, 12)
+	//benchmarkRandomReadMultiThread(datas, db, 16)
+	//benchmarkRandomReadMultiThread(datas, db, 24)
+	//benchmarkRandomReadMultiThread(datas, db, 32)
+	//benchmarkRandomReadMultiThread(datas, db, 48)
+	//benchmarkRandomReadMultiThread(datas, db, 64)
+
 	//TableFormatPebblev6-----------------------------------, avg filesAccessed 6.78
 	//start random read benchmark, concurrency=1
 	//random read cost 387120ms
@@ -854,12 +851,19 @@ func multilevelFlushConcurrent(db *DB, keys []uint64, v uint64, spList []SubPart
 					db,
 					mem,
 					sp.Stack[sp.WriteTo:],
-					int(manifest.NumLevels-1-sp.WriteTo),
+					outputLevelForWriteTo(sp.WriteTo),
 				)
 			}
 		}(list)
 	}
 	wg.Wait()
+}
+
+func outputLevelForWriteTo(writeTo uint16) int {
+	if writeTo >= manifest.NumLevels {
+		panic("writeTo >= manifest.NumLevels")
+	}
+	return int(manifest.NumLevels - 1 - writeTo)
 }
 
 /*
@@ -968,9 +972,9 @@ func Test_multilevelFlush(t *testing.T) {
 			keys: rangeLimit(keys, sp.low, sp.High),
 			v:    1,
 		}
-		spList[i].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], int(manifest.NumLevels-1-sp.WriteTo))
+		spList[i].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], outputLevelForWriteTo(sp.WriteTo))
 	}
-	pmtinternal.PartIdx = newPartIdxFromSubParts(spList)
+	pmtinternal.PartIdx = newPartIdxFrom(spList)
 	println(db.LSMViewURL())
 
 	spList = []SubPart{
@@ -995,9 +999,9 @@ func Test_multilevelFlush(t *testing.T) {
 			keys: rangeLimit(keys, sp.low, sp.High),
 			v:    2,
 		}
-		spList[i].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], int(manifest.NumLevels-1-sp.WriteTo))
+		spList[i].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], outputLevelForWriteTo(sp.WriteTo))
 	}
-	pmtinternal.PartIdx = newPartIdxFromSubParts(spList)
+	pmtinternal.PartIdx = newPartIdxFrom(spList)
 	println(db.LSMViewURL())
 
 	spList = []SubPart{
@@ -1029,9 +1033,9 @@ func Test_multilevelFlush(t *testing.T) {
 			keys: rangeLimit(keys, sp.low, sp.High),
 			v:    3,
 		}
-		spList[i].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], int(manifest.NumLevels-1-sp.WriteTo))
+		spList[i].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], outputLevelForWriteTo(sp.WriteTo))
 	}
-	pmtinternal.PartIdx = newPartIdxFromSubParts(spList)
+	pmtinternal.PartIdx = newPartIdxFrom(spList)
 	println(db.LSMViewURL())
 	use(pmtinternal.PartIdx)
 }
@@ -1088,9 +1092,9 @@ func Test_multilevelFlush_pprof(t *testing.T) {
 	for r := 0; r < rounds; r++ {
 		path := filepath.Join(dir, fmt.Sprintf("normal_plus_round_%03d.bin", r))
 		d := LoadDataFile(path)
-		spList := plan()
+		spList := plan(d.Keys)
 		multilevelFlushConcurrent(db, d.Keys, uint64(r), spList, flushConcurrency)
-		pmtinternal.PartIdx = newPartIdxFromSubParts(spList)
+		pmtinternal.PartIdx = newPartIdxFrom(spList)
 	}
 	t.Logf("pprof cpu profile written to %s", profPath)
 }
@@ -1101,57 +1105,6 @@ func MustIngestToLevel(db *DB, dir string, name string, level int) {
 	if err != nil {
 		panic(err)
 	}
-}
-
-func plan() []SubPart {
-	ret := make([]SubPart, 0, 256)
-	for _, p := range pmtinternal.PartIdx {
-		sp := SubPart{
-			High:    p.High,
-			low:     p.Low,
-			WriteTo: uint16(len(p.Stack)),
-			Stack:   p.Stack,
-			Outputs: nil,
-		}
-		if len(sp.Stack) > 6 {
-			println("len(sp.Stack) > 6")
-			sp.WriteTo = 0
-		}
-		ret = append(ret, sp)
-	}
-	return ret
-}
-
-// 打印文件中的所有k
-func printFileContent(db *DB, file *manifest.TableMetadata) {
-	if file == nil {
-		panic("File is nil")
-	}
-
-	ctx := context.Background()
-	iters, err := db.newIters(ctx, file, nil, internalIterOpts{}, iterPointKeys|iterRangeDeletions|iterRangeKeys)
-	if err != nil {
-		panic(err.Error())
-	}
-	defer iters.CloseAll()
-
-	iter := iters.Point()
-	if iter == nil {
-		panic("Point iterator is nil")
-	}
-
-	println(fmt.Sprintf("=== FileNum=%d, Size=%d bytes ===", file.FileNum, file.Size))
-	smallestKey := binary.BigEndian.Uint64(file.Smallest.UserKey)
-	largestKey := binary.BigEndian.Uint64(file.Largest.UserKey)
-	println(fmt.Sprintf("Smallest=%d, Largest=%d, SeqNum=[%d,%d]",
-		smallestKey, largestKey, file.Smallest.SeqNum(), file.Largest.SeqNum()))
-
-	count := 0
-	for kv := iter.First(); kv != nil; kv = iter.Next() {
-		count++
-		println(fmt.Sprintf("%d#%s,%s", binary.BigEndian.Uint64(kv.K.UserKey), kv.K.SeqNum(), kv.K.Kind()))
-	}
-	println(fmt.Sprintf("Total keys: %d", count))
 }
 
 // 有多少碎片文件
@@ -1168,23 +1121,6 @@ func scanFiles(db *DB) {
 		}
 	}
 	println(fmt.Sprintf("tableCt:%d table0Ct:%d", ct, table0))
-}
-
-// 平均重叠数
-func avg(db *DB) {
-	ct := 0
-	sum := 0
-	it, err := db.NewIter(nil)
-	if err != nil {
-		panic(err)
-	}
-
-	for ok := it.First(); ok; ok = it.Next() {
-		ct++
-		_, tables := db.MustGet(it.Key())
-		sum += tables
-	}
-	println(fmt.Sprintf("ct:%d, avg:%f", ct, float64(sum)/float64(ct)))
 }
 
 // Test_PMT_Format_Basic 演示 PMT 格式的基本用法
