@@ -478,6 +478,37 @@ func pmtPartForKey(k uint64) (pmtinternal.Part, bool) {
 	return pmtinternal.Part{}, false
 }
 
+// PMTMissProbeCountForKey estimates PMT lookup probes on a miss for key k.
+// It counts files in the matched partition stack whose [Smallest, Largest] contains k.
+func (d *DB) PMTMissProbeCountForKey(k uint64) int {
+	_ = d
+	part, ok := pmtPartForKey(k)
+	if !ok {
+		panic("why")
+	}
+	probeCount := 0
+	for i := len(part.Stack) - 1; i >= 0; i-- {
+		fn := part.Stack[i]
+		info, ok := pmtinternal.SstMap[uint64(fn)]
+		if !ok {
+			panic(fmt.Sprintf("file %d not found in SstMap", fn))
+		}
+		if info.Smallest <= k && k <= info.Largest {
+			probeCount++
+		}
+	}
+	return probeCount
+}
+
+// PMTAverageMissProbeCount returns average PMT miss probe count across keys.
+func (d *DB) PMTAverageMissProbeCount(keys []uint64) float64 {
+	var sum uint64
+	for _, k := range keys {
+		sum += uint64(d.PMTMissProbeCountForKey(k))
+	}
+	return float64(sum) / float64(len(keys))
+}
+
 func (d *DB) pmtGetFromFile(meta *tableMetadata, k uint64) (uint64, bool) {
 	if meta == nil {
 		return 0, false

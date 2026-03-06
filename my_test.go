@@ -660,8 +660,8 @@ func Test_pmt_r(t *testing.T) {
 		options.FileFormat = sstable.TableFormatPMT0
 		//options.FileFormat = sstable.TableFormatPebblev6
 
-		pagesize := 4 << 10                                  // 4KB
-		options.CacheSize = int64(4096 * 16 * 16 * pagesize) //
+		pagesize := 4 << 10 // 4KB
+		options.CacheSize = int64(1024 * 16 * pagesize)
 		options.DisableAutomaticCompactions = true
 		options.MaxConcurrentCompactions = func() int { return 8 }
 		options.ReadOnly = true // important
@@ -685,6 +685,7 @@ func Test_pmt_r(t *testing.T) {
 	benchmarkRandomReadMultiThread(datas, db, 32)
 	benchmarkRandomReadMultiThread(datas, db, 48)
 	benchmarkRandomReadMultiThread(datas, db, 64)
+	println(fmt.Sprintf("avgMissProbeCount=%.4f", db.PMTAverageMissProbeCount(datas)))
 }
 
 // 可能需要用全局变量判断, 目前只用writeBarrierFS

@@ -227,7 +227,6 @@ func (g *getIter) initializeNextIterator() (ok bool) {
 				return false
 			}
 			g.iter = iter
-			g.filesAccessed++
 			return true
 		}
 		// We've exhausted all the sublevels of L0. Progress to L1.
@@ -249,7 +248,6 @@ func (g *getIter) initializeNextIterator() (ok bool) {
 		}
 		g.level++
 		g.iter = iter
-		g.filesAccessed++
 		return true
 	}
 	// We've exhausted all levels of the LSM.
@@ -273,8 +271,8 @@ func (g *getIter) getSSTableIterators(
 	if m == nil || !m.HasPointKeys || g.comparer.Compare(m.SmallestPointKey.UserKey, g.key) > 0 {
 		return emptyIter, nil, nil
 	}
-	//g.filesAccessed++
-	//println("嘻嘻")
+	// Count only real SST probes. Empty-level checks above must not be counted.
+	g.filesAccessed++
 	// m may possibly contain point (or range deletion) keys relevant to g.key.
 	g.iterOpts.layer = level
 	iters, err := g.newIters(context.Background(), m, &g.iterOpts, internalIterOpts{}, iterPointKeys|iterRangeDeletions)
