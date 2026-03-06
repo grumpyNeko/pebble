@@ -237,7 +237,6 @@ func recordFlushPlanStep2(flushPlan FlushPlan) {
 	flushHistory[last].step2TotalWriteExpected = flushPlan.step2TotalWriteExpected
 }
 
-var mergeCt = 0 // 用来观察, 暂时放在外面, 以后也许..
 func passiveMergePlan(flushPlan FlushPlan) FlushPlan {
 	flushPlan.step2TotalWriteExpected = flushPlan.step1TotalWriteExpected
 	if len(flushPlan.planList) < 2 {
@@ -260,8 +259,6 @@ func passiveMergePlan(flushPlan FlushPlan) FlushPlan {
 			// no need to check keyrange
 			cur.High = next.High
 			cur.Stack = append(cur.Stack, next.Stack...)
-
-			mergeCt++
 			passiveMergeCount++
 		}
 		merged = append(merged, cur)

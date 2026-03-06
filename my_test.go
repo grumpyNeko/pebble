@@ -560,7 +560,6 @@ func Test_pmt_wa(t *testing.T) {
 	metrics := stat(db)
 	use(metrics)
 	printPartStat()
-	println(mergeCt)
 	printTotalWriteExpectedList()
 	// ------------------------------
 	// disk 128pagescache nocompression 128round, 0.129ms
@@ -773,7 +772,6 @@ func benchmarkRandomReadMultiThread(datas []uint64, db *DB, concurrency int) {
 	rand.Shuffle(len(datas), func(i, j int) {
 		datas[i], datas[j] = datas[j], datas[i]
 	})
-	println(fmt.Sprintf("start random read benchmark, concurrency=%d", concurrency))
 	start := time.Now()
 	var wg sync.WaitGroup
 	var totalFilesAccessed atomic.Int64
@@ -802,7 +800,8 @@ func benchmarkRandomReadMultiThread(datas []uint64, db *DB, concurrency int) {
 		}(keys)
 	}
 	wg.Wait()
-	println(fmt.Sprintf("random read cost %dms", time.Since(start).Milliseconds()))
+	cost := time.Since(start).Milliseconds()
+	println(fmt.Sprintf("randomread%d=%dms", concurrency, cost))
 	avgFilesAccessed := float64(totalFilesAccessed.Load()) / float64(totalReads.Load())
 	println(fmt.Sprintf("avg filesAccessed %.4f", avgFilesAccessed))
 
