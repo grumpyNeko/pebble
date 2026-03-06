@@ -100,15 +100,7 @@ func pmtOptions() *Options {
 
 		MemTableSize: 1 << 24, // 16MB, 足够大就关闭自动flush
 		EventListener: &EventListener{
-			//FlushBegin: func(info FlushInfo) {
-			//	println(fmt.Sprintf("FlushBegin %v", info))
-			//},
-			FlushEnd: FlushEnd,
-			//CompactionBegin: func(info CompactionInfo) {
-			//	println(fmt.Sprintf("CompactionBegin %v", info))
-			//},
 			CompactionEnd: CompactionEnd,
-			TableIngested: TableIngested,
 			BackgroundError: func(err error) {
 				println(fmt.Sprintf("BackgroundError %v", err))
 			},
@@ -289,44 +281,6 @@ func newPartIdx(inputs []manifest.TableInfo, outputs []manifest.TableInfo) (part
 		})
 	}
 	return
-}
-
-// IMPORTANT, pmt的multilevelFlush走CompactionEnd，不FlushEnd
-func FlushEnd(info FlushInfo) {
-	println(fmt.Sprintf("FlushEnd %v", info))
-	if pmtinternal.EnablePMT {
-		panic("why")
-	}
-
-	outputs := []manifest.TableInfo{}
-	for _, e := range info.Output {
-		outputs = append(outputs, e)
-	}
-
-	for _, e := range outputs {
-		pmtinternal.AddToMap(uint64(e.FileNum), pmtinternal.SstInfo{
-			Size:     e.Size,
-			Smallest: binary.BigEndian.Uint64(e.Smallest.UserKey),
-			Largest:  binary.BigEndian.Uint64(e.Largest.UserKey),
-		})
-	}
-	pmtinternal.PartIdx = newPartIdx(nil, outputs)
-}
-
-// TODO: 确保只能用于初始化
-func TableIngested(info TableIngestInfo) {
-	println(fmt.Sprintf("TableIngested %v", info))
-	if !pmtinternal.EnablePMT {
-		return
-	}
-	for _, e := range info.Tables {
-		pmtinternal.AddToMap(uint64(e.FileNum), pmtinternal.SstInfo{
-			Size:     e.Size,
-			Smallest: binary.BigEndian.Uint64(e.Smallest.UserKey),
-			Largest:  binary.BigEndian.Uint64(e.Largest.UserKey),
-		})
-	}
-	// TODO
 }
 
 func MustFind(list []base.FileNum, target uint64) int {

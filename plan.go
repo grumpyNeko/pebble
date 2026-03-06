@@ -30,13 +30,22 @@ type PartPlanStat struct {
 }
 
 type FlushPlanStat struct {
-	plans []PartPlanStat
+	passiveMergeCount       int
+	activeMergeCount        int
+	step1TotalWriteExpected uint64
+	step2TotalWriteExpected uint64
+	plans                   []PartPlanStat
 }
 
 var flushHistory []FlushPlanStat
+var step2TotalWriteExpectedList []uint64
 
 type FlushPlan struct {
-	planList []PartPlan
+	passiveMergeCount       int
+	activeMergeCount        int
+	step1TotalWriteExpected uint64
+	step2TotalWriteExpected uint64
+	planList                []PartPlan
 }
 
 // todo: 改成并发的
@@ -44,6 +53,7 @@ func planStep1(newKeys []uint64) FlushPlan {
 	pList := make([]PartPlan, 0, 256)
 
 	tmp := make([]PartPlanStat, 0, len(pmtinternal.PartIdx))
+	var step1TotalWriteExpected uint64
 	for _, p := range pmtinternal.PartIdx {
 		sp := PartPlan{
 			High:    p.High,
@@ -87,6 +97,7 @@ func planStep1(newKeys []uint64) FlushPlan {
 			panic("writeTo >= MaxStackLen")
 		}
 		sp.WriteTo = uint16(writeTo)
+		step1TotalWriteExpected += uint64(newPages) + sumStackPagesFrom(sp.Stack, int(sp.WriteTo))
 		stack := make([]uint64, 0, len(sp.Stack))
 		for _, fn := range sp.Stack {
 			info, ok := pmtinternal.SstMap[uint64(fn)]
@@ -106,17 +117,65 @@ func planStep1(newKeys []uint64) FlushPlan {
 		pList = append(pList, sp)
 	}
 
-	flushHistory = append(flushHistory, FlushPlanStat{plans: tmp})
-	return FlushPlan{planList: pList}
+	flushHistory = append(flushHistory, FlushPlanStat{
+		passiveMergeCount:       0,
+		activeMergeCount:        0,
+		step1TotalWriteExpected: step1TotalWriteExpected,
+		step2TotalWriteExpected: step1TotalWriteExpected,
+		plans:                   tmp,
+	})
+	return FlushPlan{
+		passiveMergeCount:       0,
+		activeMergeCount:        0,
+		step1TotalWriteExpected: step1TotalWriteExpected,
+		step2TotalWriteExpected: step1TotalWriteExpected,
+		planList:                pList,
+	}
+}
+
+func sumStackPagesFrom(stack []FileNum, from int) uint64 {
+	if from < 0 || from > len(stack) {
+		panic("sumStackPagesFrom: invalid from")
+	}
+	var pages uint64
+	for i := from; i < len(stack); i++ {
+		info, ok := pmtinternal.SstMap[uint64(stack[i])]
+		if !ok {
+			panic(fmt.Sprintf("sumStackPagesFrom: file %d not found in SstMap", stack[i]))
+		}
+		pages += sstSizeInPages(info.Size)
+	}
+	return pages
+}
+
+func sstSizeInPages(size uint64) uint64 {
+	if size == 0 {
+		return 0
+	}
+	return (size + uint64(PageSize) - 1) / uint64(PageSize)
+}
+
+func recordFlushPlanStep2(flushPlan FlushPlan) {
+	step2TotalWriteExpectedList = append(step2TotalWriteExpectedList, flushPlan.step2TotalWriteExpected)
+	if len(flushHistory) == 0 {
+		return
+	}
+	last := len(flushHistory) - 1
+	flushHistory[last].passiveMergeCount = flushPlan.passiveMergeCount
+	flushHistory[last].activeMergeCount = flushPlan.activeMergeCount
+	flushHistory[last].step2TotalWriteExpected = flushPlan.step2TotalWriteExpected
 }
 
 var mergeCt = 0 // 用来观察, 暂时放在外面, 以后也许..
 func passiveMergePlan(flushPlan FlushPlan) FlushPlan {
+	flushPlan.step2TotalWriteExpected = flushPlan.step1TotalWriteExpected
 	if len(flushPlan.planList) < 2 {
+		recordFlushPlanStep2(flushPlan)
 		return flushPlan
 	}
 
 	merged := make([]PartPlan, 0, len(flushPlan.planList))
+	passiveMergeCount := 0
 	for i := 0; i < len(flushPlan.planList); { // 双指针
 		cur := flushPlan.planList[i]
 		if cur.WriteTo != 0 {
@@ -132,11 +191,20 @@ func passiveMergePlan(flushPlan FlushPlan) FlushPlan {
 			cur.Stack = append(cur.Stack, next.Stack...)
 
 			mergeCt++
+			passiveMergeCount++
 		}
 		merged = append(merged, cur)
 		i = j
 	}
-	return FlushPlan{planList: merged}
+	ret := FlushPlan{
+		passiveMergeCount:       flushPlan.passiveMergeCount + passiveMergeCount,
+		activeMergeCount:        flushPlan.activeMergeCount,
+		step1TotalWriteExpected: flushPlan.step1TotalWriteExpected,
+		step2TotalWriteExpected: flushPlan.step1TotalWriteExpected,
+		planList:                merged,
+	}
+	recordFlushPlanStep2(ret)
+	return ret
 }
 
 func activeMergePlan(list []PartPlan) []PartPlan {
@@ -156,6 +224,20 @@ func dumpFlushHistory(startFrom int, path string) {
 		if err != nil {
 			panic(err)
 		}
+		_, err = f.WriteString(fmt.Sprintf(
+			"------step1TotalWriteExpected: %d\n"+
+				"------step2TotalWriteExpected: %d\n"+
+				"------passiveMergeCount: %d\n"+
+				"------activeMergeCount: %d\n",
+			flushHistory[flushID].step1TotalWriteExpected,
+			flushHistory[flushID].step2TotalWriteExpected,
+			flushHistory[flushID].passiveMergeCount,
+			flushHistory[flushID].activeMergeCount,
+		))
+		if err != nil {
+			_ = f.Close()
+			panic(err)
+		}
 		for _, e := range flushHistory[flushID].plans {
 			_, err := f.WriteString(fmt.Sprintf(
 				"# part:[%d,%d], newPages:%d, writeTo:%d, stack: %s, reason: %s\n",
@@ -170,6 +252,27 @@ func dumpFlushHistory(startFrom int, path string) {
 			panic(err)
 		}
 	}
+}
+
+func printTotalWriteExpectedList() {
+	var b strings.Builder
+	b.WriteString("step2TotalWriteExpectedList=[")
+	var sum uint64
+	for i, v := range step2TotalWriteExpectedList {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString(fmt.Sprintf("%d", v))
+		sum += v
+	}
+	b.WriteString("]")
+	println(b.String())
+	if len(step2TotalWriteExpectedList) == 0 {
+		println("avgstep2TotalWrite=0")
+		return
+	}
+	avg := float64(sum) / float64(len(step2TotalWriteExpectedList))
+	println(fmt.Sprintf("avgstep2TotalWrite=%.2f", avg))
 }
 
 // [1000,500,155,100]

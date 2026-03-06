@@ -360,15 +360,15 @@ func Test_MyGet(t *testing.T) {
 
 // normal_plus
 // 64, 耗时: 91759+77551=169310=>396.37 Kops
-// 128, 耗时: 346264+100101=446365=>300.69 Kops; 点读耗时={512page, 101198ms}
+// 128,
 func Test_pebble_wa(t *testing.T) {
-	db := MustDB("test-db", true, EnablePebble, func(options *Options) *Options {
+	db := MustDB("mybench_pmt", true, EnablePebble, func(options *Options) *Options {
 		options.FS = vfs.Default
 		options.DisableAutomaticCompactions = false
 
 		options.FileFormat = sstable.TableFormatLevelDB
-		pagesize := 4 << 10                        // 4KB
-		options.CacheSize = int64(4096 * pagesize) // 4096=>16MB
+		pagesize := 4 << 10                             // 4KB
+		options.CacheSize = int64(1024 * 16 * pagesize) //
 		options.MaxConcurrentCompactions = func() int { return 8 }
 		return options
 	})
@@ -396,12 +396,6 @@ func Test_pebble_wa(t *testing.T) {
 	}
 	println(fmt.Sprintf("等待压实耗时(ms): %d", time.Since(compactWaitStart).Milliseconds()))
 
-	metrics := stat(db)
-	use(metrics)
-	use(pmtinternal.PartIdx)
-	println(fmt.Sprintf("total bytes in: %d", metrics.Total().BytesIn))
-
-	//avg(db)
 	benchmarkRandomReadMultiThread(datas, db, 1)
 	benchmarkRandomReadMultiThread(datas, db, 4)
 	benchmarkRandomReadMultiThread(datas, db, 8)
@@ -411,6 +405,12 @@ func Test_pebble_wa(t *testing.T) {
 	benchmarkRandomReadMultiThread(datas, db, 32)
 	benchmarkRandomReadMultiThread(datas, db, 48)
 	benchmarkRandomReadMultiThread(datas, db, 64)
+
+	metrics := stat(db)
+	use(metrics)
+	use(pmtinternal.PartIdx)
+	println(fmt.Sprintf("total bytes in: %d", metrics.Total().BytesIn))
+
 	// 512page
 	//start random read benchmark, concurrency=1
 	//random read cost 110631ms
@@ -553,12 +553,13 @@ func Test_pmt_wa(t *testing.T) {
 	}
 	println(fmt.Sprintf("写入阶段耗时(ms): %d", time.Since(writeStart).Milliseconds()))
 
-	//dumpFlushHistory(62, "w_flushhistory")
+	dumpFlushHistory(126, "w_flushhistory")
 
 	metrics := stat(db)
 	use(metrics)
 	printPartStat()
 	println(mergeCt)
+	printTotalWriteExpectedList()
 	// ------------------------------
 	// disk 128pagescache nocompression 128round, 0.129ms
 	// disk 512pagescache nocompression 128round, 0.112ms
@@ -570,15 +571,15 @@ func Test_pmt_wa(t *testing.T) {
 	// pmt 256pagescache nocompression 128round, 47.1us
 	//benchmarkRandomRead(datas, db)
 
-	//benchmarkRandomReadMultiThread(datas, db, 1)
-	//benchmarkRandomReadMultiThread(datas, db, 4)
-	//benchmarkRandomReadMultiThread(datas, db, 8)
-	//benchmarkRandomReadMultiThread(datas, db, 12)
+	benchmarkRandomReadMultiThread(datas, db, 1)
+	benchmarkRandomReadMultiThread(datas, db, 4)
+	benchmarkRandomReadMultiThread(datas, db, 8)
+	benchmarkRandomReadMultiThread(datas, db, 12)
 	benchmarkRandomReadMultiThread(datas, db, 16)
-	//benchmarkRandomReadMultiThread(datas, db, 24)
-	//benchmarkRandomReadMultiThread(datas, db, 32)
-	//benchmarkRandomReadMultiThread(datas, db, 48)
-	//benchmarkRandomReadMultiThread(datas, db, 64)
+	benchmarkRandomReadMultiThread(datas, db, 24)
+	benchmarkRandomReadMultiThread(datas, db, 32)
+	benchmarkRandomReadMultiThread(datas, db, 48)
+	benchmarkRandomReadMultiThread(datas, db, 64)
 
 	//TableFormatPebblev6-----------------------------------, avg filesAccessed 6.78
 	//start random read benchmark, concurrency=1

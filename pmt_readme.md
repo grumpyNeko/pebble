@@ -5,7 +5,7 @@
 每个Part都是{key,files,..}
 用SstMap记录SST的 (Smallest,Largest,Size)
 
-# newPartIdxFrom
+# CompactionEnd->newPartIdxFrom
 ``` 
 newPartIdxFrom(pList) []Part {
 	ret = []
