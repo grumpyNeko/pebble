@@ -26,6 +26,8 @@ import (
 	"time"
 )
 
+const datasetPath = "ww/dataset"
+
 // writeBarrierFS blocks the first write to each sstable until N writers arrive.
 // This is a focused way to prove concurrent "write to disk" overlap.
 type writeBarrierFS struct {
@@ -115,7 +117,7 @@ func Test_pmt_basic(t *testing.T) {
 	})
 	defer db.Close()
 
-	path := filepath.Join("pmttestdata", "normal_plus_round_000.bin")
+	path := filepath.Join(datasetPath, "normal_plus_round_000.bin")
 	d := LoadDataFile(path)
 	keys := d.Keys
 
@@ -362,7 +364,8 @@ func Test_MyGet(t *testing.T) {
 // 64, 耗时: 91759+77551=169310=>396.37 Kops
 // 128,
 func Test_pebble_wa(t *testing.T) {
-	db := MustDB("mybench_pmt", true, EnablePebble, func(options *Options) *Options {
+	path := "ww/pebble"
+	db := MustDB(path, true, EnablePebble, func(options *Options) *Options {
 		options.FS = vfs.Default
 		options.DisableAutomaticCompactions = false
 
@@ -372,11 +375,12 @@ func Test_pebble_wa(t *testing.T) {
 		options.MaxConcurrentCompactions = func() int { return 8 }
 		return options
 	})
+	defer SavePMTPartIdx(path)
 
 	times := 128 // 48
 	datas := make([]uint64, 0, times<<20)
 	for i := 0; i < times; i++ {
-		path := filepath.Join("pmttestdata", fmt.Sprintf("normal_plus_round_%03d.bin", i))
+		path := filepath.Join(datasetPath, fmt.Sprintf("normal_plus_round_%03d.bin", i))
 		d := LoadDataFile(path)
 		datas = append(datas, d.Keys...)
 	}
@@ -473,8 +477,8 @@ func Test_pebble_wa(t *testing.T) {
 }
 
 func Test_pebble_r(t *testing.T) {
-	// 打开已经生成的数据
-	db := MustDB("test-db", false, EnablePebble, func(options *Options) *Options {
+	path := "ww/pebble"
+	db := MustDB(path, false, EnablePebble, func(options *Options) *Options {
 		options.FS = vfs.Default
 		options.DisableAutomaticCompactions = false
 
@@ -486,11 +490,12 @@ func Test_pebble_r(t *testing.T) {
 		options.ReadOnly = true // important
 		return options
 	})
+	db.LoadPMTPartIdxAndRecoverMap(filepath.Join(path, "partidx.json"))
 
 	times := 128 // 48
 	datas := make([]uint64, 0, times<<20)
 	for i := 0; i < times; i++ {
-		path := filepath.Join("pmttestdata", fmt.Sprintf("normal_plus_round_%03d.bin", i))
+		path := filepath.Join(datasetPath, fmt.Sprintf("normal_plus_round_%03d.bin", i))
 		d := LoadDataFile(path)
 		datas = append(datas, d.Keys...)
 	}
@@ -511,8 +516,8 @@ func Test_pebble_r(t *testing.T) {
 // 64, 写耗时: 84448,81142,97571=>687.79 Kops; 点读耗时=
 // 128, 写耗时: 195638,269629,312484,276104,225041=>596.42 Kops
 func Test_pmt_wa(t *testing.T) {
-	println(fmt.Sprintf("GOMAXPROCS=%d", runtime.GOMAXPROCS(0)))
-	db := MustDB("mybench_pmt", true, func(options *Options) *Options {
+	path := "ww/pmt"
+	db := MustDB(path, true, func(options *Options) *Options {
 		options.FS = vfs.Default
 
 		pmtinternal.SetStep1Method(pmtinternal.PlanStep1V1)
@@ -526,12 +531,13 @@ func Test_pmt_wa(t *testing.T) {
 		options.MaxConcurrentCompactions = func() int { return 8 }
 		return options
 	})
+	defer SavePMTPartIdx(path)
 
-	const flushConcurrency = 4
+	const flushConcurrency = 2
 	times := 128 // 128
 	datas := make([]uint64, 0, times<<20)
 	for i := 0; i < times; i++ {
-		path := filepath.Join("pmttestdata", fmt.Sprintf("normal_plus_round_%03d.bin", i))
+		path := filepath.Join(datasetPath, fmt.Sprintf("uniform_round_%03d.bin", i)) // normal_plus_round_%03d or uniform_round_%03d
 		d := LoadDataFile(path)
 		datas = append(datas, d.Keys...)
 	}
@@ -552,9 +558,10 @@ func Test_pmt_wa(t *testing.T) {
 		pmtinternal.PartIdx = newPartIdxFrom(flushPlan.planList) // TODO: 不是通过CompactionEnd/FlushEnd更新PartIdx
 		println(fmt.Sprintf("done %d", i))
 	}
+	SavePMTPartIdx(filepath.Join(path, "partidx.json"))
 	println(fmt.Sprintf("写入阶段耗时(ms): %d", time.Since(writeStart).Milliseconds()))
 
-	//dumpFlushHistory(126, "w_flushhistory")
+	//dumpFlushHistory(126, "ww/flushhistory")
 
 	metrics := stat(db)
 	use(metrics)
@@ -652,8 +659,8 @@ func printPartStat() {
 
 // normal_plus, 128,
 func Test_pmt_r(t *testing.T) {
-	println(fmt.Sprintf("GOMAXPROCS=%d", runtime.GOMAXPROCS(0)))
-	db := MustDB("mybench_pmt", false, func(options *Options) *Options {
+	path := "ww/pmt"
+	db := MustDB(path, false, func(options *Options) *Options {
 		options.FS = vfs.Default
 
 		pmtinternal.EnablePMTTableFormat = true
@@ -667,11 +674,12 @@ func Test_pmt_r(t *testing.T) {
 		options.ReadOnly = true // important
 		return options
 	})
+	db.LoadPMTPartIdxAndRecoverMap(filepath.Join(path, "partidx.json"))
 
 	times := 8 // 128
 	datas := make([]uint64, 0, times<<20)
 	for i := 0; i < times; i++ {
-		path := filepath.Join("pmttestdata", fmt.Sprintf("normal_plus_round_%03d.bin", i))
+		path := filepath.Join(datasetPath, fmt.Sprintf("normal_plus_round_%03d.bin", i))
 		d := LoadDataFile(path)
 		datas = append(datas, d.Keys...)
 	}
@@ -823,7 +831,7 @@ func benchmarkRandomReadWithCPUProfile(t *testing.T, datas []uint64, db *DB, pro
 func Test_gen_data(t *testing.T) {
 	const times = 128
 	deviation := uint64(1 << 32)
-	dir := "pmttestdata"
+	dir := datasetPath
 	for i := 0; i < times; i++ {
 		d := NewData()
 		mean := 1024*math.MaxUint32 + uint64(i)*(math.MaxUint32)
@@ -1099,7 +1107,7 @@ func Test_multilevelFlush_pprof(t *testing.T) {
 
 	const rounds = 64
 	const flushConcurrency = 4
-	dir := "pmttestdata"
+	dir := datasetPath
 	for r := 0; r < rounds; r++ {
 		path := filepath.Join(dir, fmt.Sprintf("normal_plus_round_%03d.bin", r))
 		d := LoadDataFile(path)
@@ -1134,7 +1142,7 @@ check all point read
 check all range read
 */
 func Test_PMT_Format_Basic(t *testing.T) {
-	path := filepath.Join("pmttestdata", "normal_plus_round_000.bin")
+	path := filepath.Join(datasetPath, "normal_plus_round_000.bin")
 	d := LoadDataFile(path)
 	keys := d.Keys
 	if len(keys) > pmtformat.MaxEntriesPerTable() {
@@ -1214,7 +1222,7 @@ func Test_PMT_Format_Basic(t *testing.T) {
 
 // 测试PMT格式的性能
 func Test_PMT_Format_Performance(t *testing.T) {
-	path := filepath.Join("pmttestdata", "normal_plus_round_000.bin")
+	path := filepath.Join(datasetPath, "normal_plus_round_000.bin")
 	d := LoadDataFile(path)
 	keys := d.Keys
 	if len(keys) > pmtformat.MaxEntriesPerTable() {

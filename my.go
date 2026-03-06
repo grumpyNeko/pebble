@@ -3,6 +3,7 @@ package pebble
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/keyspan"
@@ -18,6 +19,7 @@ import (
 	"github.com/samber/lo"
 	"math"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"sync"
@@ -478,6 +480,123 @@ func pmtPartForKey(k uint64) (pmtinternal.Part, bool) {
 	return pmtinternal.Part{}, false
 }
 
+type pmtPartPersist struct {
+	Low   uint64   `json:"low"`
+	High  uint64   `json:"high"`
+	Stack []uint64 `json:"stack"`
+}
+
+// SavePMTPartIdx saves current PMT PartIdx to a JSON file.
+func SavePMTPartIdx(path string) {
+	parts := make([]pmtPartPersist, 0, len(pmtinternal.PartIdx))
+	for _, p := range pmtinternal.PartIdx {
+		stack := make([]uint64, 0, len(p.Stack))
+		for _, fn := range p.Stack {
+			stack = append(stack, uint64(fn))
+		}
+		parts = append(parts, pmtPartPersist{
+			Low:   p.Low,
+			High:  p.High,
+			Stack: stack,
+		})
+	}
+	data, err := json.MarshalIndent(parts, "", "  ")
+	if err != nil {
+		panic(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		panic(err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		panic(err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		// Windows may reject rename-over-existing-file; remove destination then retry.
+		if rmErr := os.Remove(path); rmErr == nil || os.IsNotExist(rmErr) {
+			if retryErr := os.Rename(tmp, path); retryErr == nil {
+				return
+			}
+		}
+		// Fallback to non-atomic overwrite to keep benchmark flow.
+		if writeErr := os.WriteFile(path, data, 0644); writeErr == nil {
+			_ = os.Remove(tmp)
+			return
+		}
+		panic(err)
+	}
+}
+
+// LoadPMTPartIdx loads PartIdx from a JSON file.
+func LoadPMTPartIdx(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		panic(err)
+	}
+	var partsOnDisk []pmtPartPersist
+	if err := json.Unmarshal(data, &partsOnDisk); err != nil {
+		panic(err)
+	}
+	if len(partsOnDisk) == 0 {
+		panic("LoadPMTPartIdx: empty partidx file")
+	}
+	parts := make([]pmtinternal.Part, 0, len(partsOnDisk))
+	for _, p := range partsOnDisk {
+		stack := make([]base.FileNum, 0, len(p.Stack))
+		for _, fn := range p.Stack {
+			stack = append(stack, base.FileNum(fn))
+		}
+		parts = append(parts, pmtinternal.Part{
+			Low:   p.Low,
+			High:  p.High,
+			Stack: stack,
+			Tmp:   nil,
+		})
+	}
+	pmtinternal.PartIdx = parts
+}
+
+// RecoverPMTSstMapFromCurrentVersion rebuilds SstMap from current live SSTs.
+func (d *DB) RecoverPMTSstMapFromCurrentVersion() {
+	vers := d.DebugCurrentVersion()
+	newMap := make(map[uint64]pmtinternal.SstInfo, 1024)
+	for level := 0; level < numLevels; level++ {
+		iter := vers.Levels[level].Iter()
+		for f := iter.First(); f != nil; f = iter.Next() {
+			if !f.HasPointKeys {
+				continue
+			}
+			if len(f.SmallestPointKey.UserKey) != 8 || len(f.LargestPointKey.UserKey) != 8 {
+				panic(fmt.Sprintf("RecoverPMTSstMapFromCurrentVersion: file %s has non-uint64 keys", f.FileNum))
+			}
+			smallest := binary.BigEndian.Uint64(f.SmallestPointKey.UserKey)
+			largest := binary.BigEndian.Uint64(f.LargestPointKey.UserKey)
+			if largest < smallest {
+				panic(fmt.Sprintf("RecoverPMTSstMapFromCurrentVersion: invalid key bounds for file %s", f.FileNum))
+			}
+			newMap[uint64(f.FileNum)] = pmtinternal.SstInfo{
+				Size:     uint64(f.Size),
+				Smallest: smallest,
+				Largest:  largest,
+			}
+		}
+	}
+	for _, p := range pmtinternal.PartIdx {
+		for _, fn := range p.Stack {
+			if _, ok := newMap[uint64(fn)]; !ok {
+				panic(fmt.Sprintf("RecoverPMTSstMapFromCurrentVersion: stack file %d not found in live SSTs", fn))
+			}
+		}
+	}
+	pmtinternal.SstMap = newMap
+}
+
+// LoadPMTPartIdxAndRecoverMap loads PartIdx from file, then scans DB to recover SstMap.
+func (d *DB) LoadPMTPartIdxAndRecoverMap(path string) {
+	LoadPMTPartIdx(path)
+	d.RecoverPMTSstMapFromCurrentVersion()
+}
+
 // PMTMissProbeCountForKey estimates PMT lookup probes on a miss for key k.
 // It counts files in the matched partition stack whose [Smallest, Largest] contains k.
 func (d *DB) PMTMissProbeCountForKey(k uint64) int {
@@ -502,6 +621,9 @@ func (d *DB) PMTMissProbeCountForKey(k uint64) int {
 
 // PMTAverageMissProbeCount returns average PMT miss probe count across keys.
 func (d *DB) PMTAverageMissProbeCount(keys []uint64) float64 {
+	if len(keys) == 0 {
+		return 0
+	}
 	var sum uint64
 	for _, k := range keys {
 		sum += uint64(d.PMTMissProbeCountForKey(k))
