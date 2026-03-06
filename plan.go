@@ -17,6 +17,7 @@ const (
 	plan1A               = 1.0
 	plan1B               = 2.0
 	plan1WriteToBoundary = 4
+	step1SimpleMaxStack  = 4
 	MaxStackLen          = 7
 )
 
@@ -50,8 +51,76 @@ type FlushPlan struct {
 
 // todo: 改成并发的
 func planStep1(newKeys []uint64) FlushPlan {
-	pList := make([]PartPlan, 0, 256)
+	switch pmtinternal.Step1Method {
+	case pmtinternal.PlanStep1Simple:
+		return step1Simple()
+	case pmtinternal.PlanStep1V1:
+		return step1V1(newKeys)
+	default:
+		panic(fmt.Sprintf("planStep1: unknown step1 method %d", pmtinternal.Step1Method))
+	}
+}
 
+func step1Simple() FlushPlan {
+	pList := make([]PartPlan, 0, 256)
+	tmp := make([]PartPlanStat, 0, len(pmtinternal.PartIdx))
+	var step1TotalWriteExpected uint64
+	for _, p := range pmtinternal.PartIdx {
+		sp := PartPlan{
+			High:    p.High,
+			low:     p.Low,
+			WriteTo: uint16(len(p.Stack)),
+			Stack:   p.Stack,
+			Outputs: nil,
+		}
+		writeTo := len(sp.Stack)
+		reason := "append_only"
+		if len(sp.Stack) > step1SimpleMaxStack {
+			writeTo = 0
+			reason = "stack_len_gt_4"
+		}
+		if writeTo >= MaxStackLen {
+			panic("writeTo >= MaxStackLen")
+		}
+		sp.WriteTo = uint16(writeTo)
+		step1TotalWriteExpected += sumStackPagesFrom(sp.Stack, int(sp.WriteTo))
+		stack := make([]uint64, 0, len(sp.Stack))
+		for _, fn := range sp.Stack {
+			info, ok := pmtinternal.SstMap[uint64(fn)]
+			if !ok {
+				panic(fmt.Sprintf("planStep1 snapshot: file %d not found in SstMap", fn))
+			}
+			stack = append(stack, info.Size/uint64(PageSize))
+		}
+		tmp = append(tmp, PartPlanStat{
+			PartLow:  sp.low,
+			PartHigh: sp.High,
+			NewPages: 0,
+			WriteTo:  sp.WriteTo,
+			Stack:    stack,
+			Reason:   reason,
+		})
+		pList = append(pList, sp)
+	}
+
+	flushHistory = append(flushHistory, FlushPlanStat{
+		passiveMergeCount:       0,
+		activeMergeCount:        0,
+		step1TotalWriteExpected: step1TotalWriteExpected,
+		step2TotalWriteExpected: step1TotalWriteExpected,
+		plans:                   tmp,
+	})
+	return FlushPlan{
+		passiveMergeCount:       0,
+		activeMergeCount:        0,
+		step1TotalWriteExpected: step1TotalWriteExpected,
+		step2TotalWriteExpected: step1TotalWriteExpected,
+		planList:                pList,
+	}
+}
+
+func step1V1(newKeys []uint64) FlushPlan {
+	pList := make([]PartPlan, 0, 256)
 	tmp := make([]PartPlanStat, 0, len(pmtinternal.PartIdx))
 	var step1TotalWriteExpected uint64
 	for _, p := range pmtinternal.PartIdx {

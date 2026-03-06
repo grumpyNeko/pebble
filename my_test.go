@@ -519,6 +519,8 @@ func Test_pmt_wa(t *testing.T) {
 		options.FileFormat = sstable.TableFormatPMT0
 		//options.FileFormat = sstable.TableFormatPebblev6
 
+		pmtinternal.SetStep1Method(pmtinternal.PlanStep1Simple)
+
 		pagesize := 4 << 10                             // 4KB
 		options.CacheSize = int64(1024 * 16 * pagesize) //
 		options.DisableAutomaticCompactions = true

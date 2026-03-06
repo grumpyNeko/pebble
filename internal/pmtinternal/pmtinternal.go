@@ -9,6 +9,24 @@ import (
 var EnablePMT = true
 var EnablePMTTableFormat = false
 
+type PlanStep1Method uint8
+
+const (
+	PlanStep1Simple PlanStep1Method = iota
+	PlanStep1V1
+)
+
+var Step1Method = PlanStep1V1
+
+func SetStep1Method(m PlanStep1Method) {
+	switch m {
+	case PlanStep1Simple, PlanStep1V1:
+		Step1Method = m
+	default:
+		panic(fmt.Sprintf("SetStep1Method: unknown method %d", m))
+	}
+}
+
 var PartIdx []Part = []Part{
 	Part{
 		Low:   0,
