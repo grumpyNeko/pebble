@@ -765,6 +765,10 @@ func benchmarkRandomReadMultiThread(datas []uint64, db *DB, concurrency int) {
 	if concurrency < 1 {
 		panic("concurrency < 1")
 	}
+	startMetrics := db.Metrics()
+	startBlockHits := startMetrics.BlockCache.Hits
+	startBlockMisses := startMetrics.BlockCache.Misses
+
 	readN := 1 << 20
 	rand.Shuffle(len(datas), func(i, j int) {
 		datas[i], datas[j] = datas[j], datas[i]
@@ -801,6 +805,14 @@ func benchmarkRandomReadMultiThread(datas []uint64, db *DB, concurrency int) {
 	println(fmt.Sprintf("random read cost %dms", time.Since(start).Milliseconds()))
 	avgFilesAccessed := float64(totalFilesAccessed.Load()) / float64(totalReads.Load())
 	println(fmt.Sprintf("avg filesAccessed %.4f", avgFilesAccessed))
+
+	endMetrics := db.Metrics()
+	deltaBlockHits := endMetrics.BlockCache.Hits - startBlockHits
+	deltaBlockMisses := endMetrics.BlockCache.Misses - startBlockMisses
+	println(fmt.Sprintf(
+		"blockcache during benchmark: hits=%d misses=%d hitRate=%.2f%%",
+		deltaBlockHits, deltaBlockMisses, hitRate(deltaBlockHits, deltaBlockMisses),
+	))
 }
 
 func benchmarkRandomReadWithCPUProfile(t *testing.T, datas []uint64, db *DB, profPath string) {

@@ -552,8 +552,8 @@ func (d myAlwaysMultiLevel) pick(
 func (d myAlwaysMultiLevel) allowL0() bool  { return false }
 func (d myAlwaysMultiLevel) String() string { return "always" }
 
-func stat(db *DB) *Metrics {
-	println(db.LSMViewURL())
+func stat(db *DB) *Metrics { // todo: 改为计算WA? 但是需要知道单个文件大小
+	//println(db.LSMViewURL())
 	m := db.Metrics()
 	println(fmt.Sprintf("%v", m))
 	return m

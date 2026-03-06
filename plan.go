@@ -12,13 +12,9 @@ import (
 )
 
 const (
-	KVPerPage            = 4096 / 16
-	PageSize             = 4096
-	plan1A               = 1.0
-	plan1B               = 2.0
-	plan1WriteToBoundary = 4
-	step1SimpleMaxStack  = 4
-	MaxStackLen          = 7
+	KVPerPage   = 4096 / 16
+	PageSize    = 4096
+	MaxStackLen = 7
 )
 
 type PartPlanStat struct {
@@ -62,6 +58,8 @@ func planStep1(newKeys []uint64) FlushPlan {
 }
 
 func step1Simple() FlushPlan {
+	const threshold = 3
+
 	pList := make([]PartPlan, 0, 256)
 	tmp := make([]PartPlanStat, 0, len(pmtinternal.PartIdx))
 	var step1TotalWriteExpected uint64
@@ -75,9 +73,9 @@ func step1Simple() FlushPlan {
 		}
 		writeTo := len(sp.Stack)
 		reason := "append_only"
-		if len(sp.Stack) > step1SimpleMaxStack {
+		if len(sp.Stack) > threshold {
 			writeTo = 0
-			reason = "stack_len_gt_4"
+			reason = "stack_len_reach_threshold"
 		}
 		if writeTo >= MaxStackLen {
 			panic("writeTo >= MaxStackLen")
@@ -120,6 +118,10 @@ func step1Simple() FlushPlan {
 }
 
 func step1V1(newKeys []uint64) FlushPlan {
+	const plan1A = 1.0
+	const plan1B = 2.0
+	const plan1WriteToBoundary = 4
+
 	pList := make([]PartPlan, 0, 256)
 	tmp := make([]PartPlanStat, 0, len(pmtinternal.PartIdx))
 	var step1TotalWriteExpected uint64
