@@ -119,6 +119,25 @@ pmtformat.NewIter, 用pmtCachedReadable包Readable, 传给pmtformat.NewIter, 增
 - compaction的读取不缓存：internalOpts.compaction时只走ReadHandle.SetupForCompaction()
 - 计数hit/miss?  db.Metrics()..BlockCache.Misses
 
+# 对比TableFormatLevelDB和TableFormatPMT的随机点查找性能
+pmt快很多
+在一个单元测试里, 先用现有测试数据构造文件, 随机查询1M次, 统计时间
 
+根据Test_pmt_wa和Test_pebble_wa, 写入128轮normal_plus
+一次随机查找, pebble平均查找3.77个文件, pmt平均查找3.9914个文件
+16线程并发
+random read需12853ms
+pmt需16376ms
 
+为什么pmt格式文件本身更快, 但整体上更慢
+newPMTIters每次都OpenForReading + NewReadHandle + NewIter
+LevelDB走table cache
+
+pmt怎么加tableCache
+先findOrCreateTable，复用Readable，不要每次OpenForReading
+
+最小落地改动点? 
+- 去掉 openFile 里对 PMT table 的 panic，见 file_cache.go:214。
+- 给 fileCacheValue 增加 PMT reader 形态（或通用 Readable 字段），见 file_cache.go:881。                                                                                                                                                     
+- newPMTIters 从 cached value 创建 iter，并用 closeHook 做 Unref，避免每次打开文件。     
 

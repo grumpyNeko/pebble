@@ -7,8 +7,10 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 )
 
 const (
@@ -52,6 +54,8 @@ func planStep1(newKeys []uint64) FlushPlan {
 		return step1Simple()
 	case pmtinternal.PlanStep1V1:
 		return step1V1(newKeys)
+	case pmtinternal.PlanStep1V2:
+		return step1V2(newKeys)
 	default:
 		panic(fmt.Sprintf("planStep1: unknown step1 method %d", pmtinternal.Step1Method))
 	}
@@ -118,73 +122,28 @@ func step1Simple() FlushPlan {
 }
 
 func step1V1(newKeys []uint64) FlushPlan {
-	const plan1A = 1.0
-	const plan1B = 2.0
-	const plan1WriteToBoundary = 4
-
-	pList := make([]PartPlan, 0, 256)
-	tmp := make([]PartPlanStat, 0, len(pmtinternal.PartIdx))
+	parts := pmtinternal.PartIdx
+	pList := make([]PartPlan, 0, len(parts))
+	tmp := make([]PartPlanStat, 0, len(parts))
 	var step1TotalWriteExpected uint64
-	for _, p := range pmtinternal.PartIdx {
-		sp := PartPlan{
-			High:    p.High,
-			low:     p.Low,
-			WriteTo: uint16(len(p.Stack)),
-			Stack:   p.Stack,
-			Outputs: nil,
-		}
 
-		newKVCount := len(rangeLimit(newKeys, sp.low, sp.High))
-		newPages := newKVCount / KVPerPage
-		if newKVCount%KVPerPage != 0 {
-			newPages++
+	// Two pointers over sorted newKeys + sorted PartIdx range to get O(P+N).
+	keyL, keyR := 0, 0
+	for _, p := range parts {
+		for keyL < len(newKeys) && newKeys[keyL] < p.Low {
+			keyL++
 		}
-
-		threshold := plan1A*float64(newPages) + plan1B
-		writeTo := len(sp.Stack)
-		rewritePages := 0
-		reason := "stack_empty"
-		if len(sp.Stack) > 0 {
-			reason = "no_threshold_limit"
+		if keyR < keyL {
+			keyR = keyL
 		}
-		for i := len(sp.Stack) - 1; i >= 0; i-- {
-			info, ok := pmtinternal.SstMap[uint64(sp.Stack[i])]
-			if !ok {
-				panic(fmt.Sprintf("planStep1: file %d not found in SstMap", sp.Stack[i]))
-			}
-			nextFilePages := int(info.Size / PageSize)
-			if float64(rewritePages+nextFilePages) > threshold {
-				reason = "reach_threshold"
-				break
-			}
-			rewritePages += nextFilePages
-			writeTo = i
+		for keyR < len(newKeys) && newKeys[keyR] <= p.High {
+			keyR++
 		}
-		if writeTo == plan1WriteToBoundary {
-			writeTo--
-			reason = "reach_cap"
-		}
-		if writeTo >= MaxStackLen {
-			panic("writeTo >= MaxStackLen")
-		}
-		sp.WriteTo = uint16(writeTo)
-		step1TotalWriteExpected += uint64(newPages) + sumStackPagesFrom(sp.Stack, int(sp.WriteTo))
-		stack := make([]uint64, 0, len(sp.Stack))
-		for _, fn := range sp.Stack {
-			info, ok := pmtinternal.SstMap[uint64(fn)]
-			if !ok {
-				panic(fmt.Sprintf("planStep1 snapshot: file %d not found in SstMap", fn))
-			}
-			stack = append(stack, info.Size/uint64(PageSize))
-		}
-		tmp = append(tmp, PartPlanStat{
-			PartLow:  sp.low,
-			PartHigh: sp.High,
-			NewPages: newPages,
-			WriteTo:  sp.WriteTo,
-			Stack:    stack,
-			Reason:   reason,
-		})
+		newKVCount := keyR - keyL
+		newPages := (newKVCount + KVPerPage - 1) / KVPerPage
+		sp, stat, writeExpected := buildStep1V1PartPlan(p, newPages)
+		step1TotalWriteExpected += writeExpected
+		tmp = append(tmp, stat)
 		pList = append(pList, sp)
 	}
 
@@ -202,6 +161,144 @@ func step1V1(newKeys []uint64) FlushPlan {
 		step2TotalWriteExpected: step1TotalWriteExpected,
 		planList:                pList,
 	}
+}
+
+func step1V2(newKeys []uint64) FlushPlan {
+	parts := pmtinternal.PartIdx
+	partCount := len(parts)
+	pList := make([]PartPlan, partCount)
+	tmp := make([]PartPlanStat, partCount)
+	chunkSize := pmtinternal.Step1V2ChunkSize
+	if chunkSize <= 0 {
+		panic(fmt.Sprintf("step1V2: invalid chunkSize %d", chunkSize))
+	}
+	workers := partCount / chunkSize
+	maxWorkers := runtime.GOMAXPROCS(0)
+	if workers > maxWorkers {
+		workers = maxWorkers
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	var wg sync.WaitGroup
+	workerWriteExpected := make([]uint64, workers)
+	for wid := 0; wid < workers; wid++ {
+		start := wid * partCount / workers
+		end := (wid + 1) * partCount / workers
+		wg.Add(1)
+		go func(workerID, start, end int) {
+			defer wg.Done()
+			if start >= end {
+				return
+			}
+			// Find first key index that may hit this worker segment.
+			keyL := sort.Search(len(newKeys), func(i int) bool {
+				return newKeys[i] >= parts[start].Low
+			})
+			keyR := keyL
+			var localWriteExpected uint64
+			for i := start; i < end; i++ {
+				p := parts[i]
+				for keyL < len(newKeys) && newKeys[keyL] < p.Low {
+					keyL++
+				}
+				if keyR < keyL {
+					keyR = keyL
+				}
+				for keyR < len(newKeys) && newKeys[keyR] <= p.High {
+					keyR++
+				}
+				newKVCount := keyR - keyL
+				newPages := (newKVCount + KVPerPage - 1) / KVPerPage
+				sp, stat, writeExpected := buildStep1V1PartPlan(p, newPages)
+				pList[i] = sp
+				tmp[i] = stat
+				localWriteExpected += writeExpected
+			}
+			workerWriteExpected[workerID] = localWriteExpected
+		}(wid, start, end)
+	}
+	wg.Wait()
+
+	var step1TotalWriteExpected uint64
+	for _, v := range workerWriteExpected {
+		step1TotalWriteExpected += v
+	}
+
+	flushHistory = append(flushHistory, FlushPlanStat{
+		passiveMergeCount:       0,
+		activeMergeCount:        0,
+		step1TotalWriteExpected: step1TotalWriteExpected,
+		step2TotalWriteExpected: step1TotalWriteExpected,
+		plans:                   tmp,
+	})
+	return FlushPlan{
+		passiveMergeCount:       0,
+		activeMergeCount:        0,
+		step1TotalWriteExpected: step1TotalWriteExpected,
+		step2TotalWriteExpected: step1TotalWriteExpected,
+		planList:                pList,
+	}
+}
+
+func buildStep1V1PartPlan(p pmtinternal.Part, newPages int) (PartPlan, PartPlanStat, uint64) {
+	const plan1A = 1.0
+	const plan1B = 2.0
+	const plan1WriteToBoundary = 4
+
+	sp := PartPlan{
+		High:    p.High,
+		low:     p.Low,
+		WriteTo: uint16(len(p.Stack)),
+		Stack:   p.Stack,
+		Outputs: nil,
+	}
+	threshold := plan1A*float64(newPages) + plan1B
+	writeTo := len(sp.Stack)
+	rewritePages := 0
+	reason := "stack_empty"
+	if len(sp.Stack) > 0 {
+		reason = "no_threshold_limit"
+	}
+	for i := len(sp.Stack) - 1; i >= 0; i-- {
+		info, ok := pmtinternal.SstMap[uint64(sp.Stack[i])]
+		if !ok {
+			panic(fmt.Sprintf("planStep1: file %d not found in SstMap", sp.Stack[i]))
+		}
+		nextFilePages := int(info.Size / PageSize)
+		if float64(rewritePages+nextFilePages) > threshold {
+			reason = "reach_threshold"
+			break
+		}
+		rewritePages += nextFilePages
+		writeTo = i
+	}
+	if writeTo == plan1WriteToBoundary {
+		writeTo--
+		reason = "reach_cap"
+	}
+	if writeTo >= MaxStackLen {
+		panic("writeTo >= MaxStackLen")
+	}
+	sp.WriteTo = uint16(writeTo)
+	writeExpected := uint64(newPages) + sumStackPagesFrom(sp.Stack, int(sp.WriteTo))
+	stack := make([]uint64, 0, len(sp.Stack))
+	for _, fn := range sp.Stack {
+		info, ok := pmtinternal.SstMap[uint64(fn)]
+		if !ok {
+			panic(fmt.Sprintf("planStep1 snapshot: file %d not found in SstMap", fn))
+		}
+		stack = append(stack, info.Size/uint64(PageSize))
+	}
+	return sp, PartPlanStat{
+		PartLow:  sp.low,
+		PartHigh: sp.High,
+		NewPages: newPages,
+		WriteTo:  sp.WriteTo,
+		Stack:    stack,
+		Reason:   reason,
+	}, writeExpected
 }
 
 func sumStackPagesFrom(stack []FileNum, from int) uint64 {

@@ -14,17 +14,26 @@ type PlanStep1Method uint8
 const (
 	PlanStep1Simple PlanStep1Method = iota
 	PlanStep1V1
+	PlanStep1V2
 )
 
 var Step1Method = PlanStep1V1
+var Step1V2ChunkSize = 64
 
 func SetStep1Method(m PlanStep1Method) {
 	switch m {
-	case PlanStep1Simple, PlanStep1V1:
+	case PlanStep1Simple, PlanStep1V1, PlanStep1V2:
 		Step1Method = m
 	default:
 		panic(fmt.Sprintf("SetStep1Method: unknown method %d", m))
 	}
+}
+
+func SetStep1V2ChunkSize(chunkSize int) {
+	if chunkSize <= 0 {
+		panic(fmt.Sprintf("SetStep1V2ChunkSize: invalid chunkSize %d", chunkSize))
+	}
+	Step1V2ChunkSize = chunkSize
 }
 
 var PartIdx []Part = []Part{

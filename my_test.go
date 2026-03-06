@@ -515,11 +515,10 @@ func Test_pmt_wa(t *testing.T) {
 	db := MustDB("mybench_pmt", true, func(options *Options) *Options {
 		options.FS = vfs.Default
 
+		pmtinternal.SetStep1Method(pmtinternal.PlanStep1V1)
 		pmtinternal.EnablePMTTableFormat = true
 		options.FileFormat = sstable.TableFormatPMT0
 		//options.FileFormat = sstable.TableFormatPebblev6
-
-		pmtinternal.SetStep1Method(pmtinternal.PlanStep1Simple)
 
 		pagesize := 4 << 10                             // 4KB
 		options.CacheSize = int64(1024 * 16 * pagesize) //
@@ -555,23 +554,13 @@ func Test_pmt_wa(t *testing.T) {
 	}
 	println(fmt.Sprintf("写入阶段耗时(ms): %d", time.Since(writeStart).Milliseconds()))
 
-	dumpFlushHistory(126, "w_flushhistory")
+	//dumpFlushHistory(126, "w_flushhistory")
 
 	metrics := stat(db)
 	use(metrics)
 	printPartStat()
 	printTotalWriteExpectedList()
 	// ------------------------------
-	// disk 128pagescache nocompression 128round, 0.129ms
-	// disk 512pagescache nocompression 128round, 0.112ms
-	// disk 256pagescache nocompression 32round, 0.0297
-	// disk 128pagescache nocompression 32round, 0.0613
-
-	// pmt 256pagescache nocompression 64round, 0.037516
-
-	// pmt 256pagescache nocompression 128round, 47.1us
-	//benchmarkRandomRead(datas, db)
-
 	benchmarkRandomReadMultiThread(datas, db, 1)
 	benchmarkRandomReadMultiThread(datas, db, 4)
 	benchmarkRandomReadMultiThread(datas, db, 8)
@@ -801,16 +790,13 @@ func benchmarkRandomReadMultiThread(datas []uint64, db *DB, concurrency int) {
 	}
 	wg.Wait()
 	cost := time.Since(start).Milliseconds()
-	println(fmt.Sprintf("randomread%d=%dms", concurrency, cost))
 	avgFilesAccessed := float64(totalFilesAccessed.Load()) / float64(totalReads.Load())
-	println(fmt.Sprintf("avg filesAccessed %.4f", avgFilesAccessed))
-
 	endMetrics := db.Metrics()
 	deltaBlockHits := endMetrics.BlockCache.Hits - startBlockHits
 	deltaBlockMisses := endMetrics.BlockCache.Misses - startBlockMisses
 	println(fmt.Sprintf(
-		"blockcache during benchmark: hits=%d misses=%d hitRate=%.2f%%",
-		deltaBlockHits, deltaBlockMisses, hitRate(deltaBlockHits, deltaBlockMisses),
+		"randomread%d=%dms, avgFilesAccessed=%.4f, hits=%d, misses=%d, hitRate=%.2f%%",
+		concurrency, cost, avgFilesAccessed, deltaBlockHits, deltaBlockMisses, hitRate(deltaBlockHits, deltaBlockMisses),
 	))
 }
 
