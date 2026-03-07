@@ -9,6 +9,9 @@ import (
 var EnablePMT = true
 var EnablePMTTableFormat = false
 
+const PMTPartIdxFilename = "PartIdx.json"
+const PMTFlushHistoryDirname = "flush_history"
+
 type PlanStep1Method uint8
 
 const (

@@ -568,6 +568,10 @@ func activeMergePlan(flushPlan FlushPlan, extraWriteThreshold uint64) FlushPlan 
 }
 
 func dumpFlushHistory(startFrom int, path string) {
+	if path == "" {
+		panic("dumpFlushHistory: empty path")
+	}
+	path = filepath.Join(path, pmtinternal.PMTFlushHistoryDirname)
 	if err := os.MkdirAll(path, 0755); err != nil {
 		panic(err)
 	}

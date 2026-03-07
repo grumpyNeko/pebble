@@ -301,6 +301,15 @@ func MustDB(path string, clear bool, list ...OptionPatch) *DB {
 	for _, e := range list {
 		opts = e(opts)
 	}
+	if opts.FS != vfs.Default && clear {
+		panic("不是vfs.Default你删除什么?")
+	}
+	if opts.FS == vfs.Default && !clear {
+		println("===============非空数据库=================")
+		if !opts.ReadOnly {
+			panic("非空数据库必须只读")
+		}
+	}
 	// 删除所有数据
 	if clear {
 		if err := os.RemoveAll(path); err != nil {
@@ -486,8 +495,19 @@ type pmtPartPersist struct {
 	Stack []uint64 `json:"stack"`
 }
 
+func resolvePMTPartIdxPath(path string) string {
+	if path == "" {
+		panic("resolvePMTPartIdxPath: empty path")
+	}
+	if filepath.Ext(path) != "" {
+		return filepath.Join(filepath.Dir(path), pmtinternal.PMTPartIdxFilename)
+	}
+	return filepath.Join(path, pmtinternal.PMTPartIdxFilename)
+}
+
 // SavePMTPartIdx saves current PMT PartIdx to a JSON file.
 func SavePMTPartIdx(path string) {
+	path = resolvePMTPartIdxPath(path)
 	parts := make([]pmtPartPersist, 0, len(pmtinternal.PartIdx))
 	for _, p := range pmtinternal.PartIdx {
 		stack := make([]uint64, 0, len(p.Stack))
@@ -529,6 +549,7 @@ func SavePMTPartIdx(path string) {
 
 // LoadPMTPartIdx loads PartIdx from a JSON file.
 func LoadPMTPartIdx(path string) {
+	path = resolvePMTPartIdxPath(path)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		panic(err)

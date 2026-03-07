@@ -437,10 +437,10 @@ func Test_pebble_r(t *testing.T) {
 // 128, 写耗时: 195638,269629,312484,276104,225041=>596.42 Kops
 func Test_pmt_wa(t *testing.T) {
 	path := "ww/pmt"
-	db := MustDB(path, true, func(options *Options) *Options {
-		options.FS = vfs.Default
+	db := MustDB(path, false, func(options *Options) *Options {
+		//options.FS = vfs.Default
 
-		pmtinternal.SetStep1Method(pmtinternal.PlanStep1Simple)
+		pmtinternal.SetStep1Method(pmtinternal.PlanStep1V2)
 		pmtinternal.EnablePMTTableFormat = true
 		options.FileFormat = sstable.TableFormatPMT0
 		//options.FileFormat = sstable.TableFormatPebblev6
@@ -452,7 +452,7 @@ func Test_pmt_wa(t *testing.T) {
 		return options
 	})
 	defer SavePMTPartIdx(filepath.Join(path, "partidx.json"))
-	defer dumpFlushHistory(0, filepath.Join(path, "flushhistory"))
+	defer dumpFlushHistory(0, path)
 
 	const flushConcurrency = 2
 	times := 128 // 128
