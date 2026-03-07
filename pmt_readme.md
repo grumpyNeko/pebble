@@ -44,6 +44,20 @@ newPartIdxFrom(pList) []Part {
 注释掉db.flush中的maybeScheduleCompaction
 修改compaction迭代器, 增加memtable
 
+# stack slot 与 pebble level
+outputLevelForWriteTo希望writeTo=0对应L6, writeTo=1对应L5, ...
+但有例外
+stack=[L6,L5,L4], writeTo=1, 写入L5, 产生两个文件                               
+stack变成[L6,L5,L5], writeTo=2, 写入L4, 但输入中有L5文件
+此时slot与Level不是一一对应
+
+怎么办 
+- stack的元素改为[]FileNum
+- outputLevel=max(outputLevelForWriteTo(writeTo),maxInputLevel), 这是不对的
+- []FileNum + []SlotID的改动更小
+
+如果stack的元素改为[]FileNum, 会对其他代码有影响: todo
+
 # TableFormatPebblev6比v1小   
 columnarblock，把key/trailer/value分列编码，固定长度数据省开销
   Header                                                                                                                                                                                                                                          

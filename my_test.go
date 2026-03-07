@@ -375,7 +375,7 @@ func Test_pebble_wa(t *testing.T) {
 		options.MaxConcurrentCompactions = func() int { return 8 }
 		return options
 	})
-	defer SavePMTPartIdx(path)
+	defer SavePMTPartIdx(filepath.Join(path, "partidx.json"))
 
 	times := 128 // 48
 	datas := make([]uint64, 0, times<<20)
@@ -520,7 +520,7 @@ func Test_pmt_wa(t *testing.T) {
 	db := MustDB(path, true, func(options *Options) *Options {
 		options.FS = vfs.Default
 
-		pmtinternal.SetStep1Method(pmtinternal.PlanStep1V1)
+		pmtinternal.SetStep1Method(pmtinternal.PlanStep1Simple)
 		pmtinternal.EnablePMTTableFormat = true
 		options.FileFormat = sstable.TableFormatPMT0
 		//options.FileFormat = sstable.TableFormatPebblev6
@@ -531,13 +531,13 @@ func Test_pmt_wa(t *testing.T) {
 		options.MaxConcurrentCompactions = func() int { return 8 }
 		return options
 	})
-	defer SavePMTPartIdx(path)
+	defer SavePMTPartIdx(filepath.Join(path, "partidx.json"))
 
 	const flushConcurrency = 2
 	times := 128 // 128
 	datas := make([]uint64, 0, times<<20)
 	for i := 0; i < times; i++ {
-		path := filepath.Join(datasetPath, fmt.Sprintf("uniform_round_%03d.bin", i)) // normal_plus_round_%03d or uniform_round_%03d
+		path := filepath.Join(datasetPath, fmt.Sprintf("normal_plus_round_%03d.bin", i)) // normal_plus_round_%03d or uniform_round_%03d
 		d := LoadDataFile(path)
 		datas = append(datas, d.Keys...)
 	}
@@ -577,7 +577,7 @@ func Test_pmt_wa(t *testing.T) {
 	benchmarkRandomReadMultiThread(datas, db, 32)
 	benchmarkRandomReadMultiThread(datas, db, 48)
 	benchmarkRandomReadMultiThread(datas, db, 64)
-
+	println(fmt.Sprintf("avgMissProbeCount=%.4f", db.PMTAverageMissProbeCount(datas)))
 	//TableFormatPebblev6-----------------------------------, avg filesAccessed 6.78
 	//start random read benchmark, concurrency=1
 	//random read cost 387120ms
@@ -668,7 +668,7 @@ func Test_pmt_r(t *testing.T) {
 		//options.FileFormat = sstable.TableFormatPebblev6
 
 		pagesize := 4 << 10 // 4KB
-		options.CacheSize = int64(1024 * 16 * pagesize)
+		options.CacheSize = int64(1024 * pagesize)
 		options.DisableAutomaticCompactions = true
 		options.MaxConcurrentCompactions = func() int { return 8 }
 		options.ReadOnly = true // important
