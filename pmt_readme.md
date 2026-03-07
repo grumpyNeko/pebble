@@ -155,7 +155,7 @@ pmt怎么加tableCache
 - 给 fileCacheValue 增加 PMT reader 形态（或通用 Readable 字段），见 file_cache.go:881。                                                                                                                                                     
 - newPMTIters 从 cached value 创建 iter，并用 closeHook 做 Unref，避免每次打开文件。     
 
-# 压实前先生成计划
+# plan
 ```
 plan(keys)
 	flushPlan = planStep1(keys)
@@ -163,10 +163,49 @@ plan(keys)
 	if flushPlan.totalWriteExpected < **
 		flushPlan = activeMergePlan(flushPlan, extraWriteThreshold)
 		flushPlan = mergeAdjacent_wt0(flushPlan)
-	recordFlushPlan to flushhistory
+	if flushPlan.totalWriteExpected > **
+	  flushPlan = delaySmallCompaction(flushPlan)
 	return flushPlan
+
+// 提前压实, 促进区间再均衡
+activeMergePlan(flushplan) {
+	pushList = []
+	for ppIdx in flushplan.wt0
+	  prev = ..
+	  succ = ..
+	  push, ok = prev和succ中更小的
+	  continue if !ok 
+	  extraWrite = 提前压实相比原方案多出来的写入量
+	  pushList += {tryPush, extraWrite}
+	pushList去重
+	pushList按extraWrite升序
+	totalExtraWrite = 0
+	for {idx, extraWrite} in tryPushList
+	  break if totalExtraWrite + extraWrite > **
+	  flushplan.wt0 += idx
+	  flushplan.plist[idx] <- writeTo=0, reason=advance
+	  flushPlan.totalExtraWrite += 提前压实的额外写入量
+	  flushplan.activeMergeCount++
+	return flushplan
+}
+
+// 推迟压实, 减少写入峰值
+delay(flushPlan) FlushPlan {
+	for idx in flushPlan.wt0 
+		pp = flushPlan.planList[idx]
+		continue if pp.NewPages >= pmtinternal.DelayCompactNewPagesThreshold 
+		remove idx from flushPlan.wt0 
+		pp.WriteTo = newWriteTo
+		reducedWrite = ..
+		flushPlan.totalWriteExpected -= reducedWrite
+		flushPlan.totalReducedWrite += reducedWrite
+		flushPlan.delayCompactCount++
+	}
+	flushPlan.wt0 = collectWt0(flushPlan.planList)
+	return flushPlan
+}
 ```
-
-extraWriteThreshold是? ..
-NoActiveMergeUntil是? 开始没数据, 不要提前压实
-
+TODO
+提前压实, 但是prev和succ哪个更适合改为writeTo=0?
+activeMergePlan, totalExtraWrite, ..很多名字不太好, 统计方式也次优
+wt0改成map, 不要多次collectWt0而是随时维护wt0

@@ -29,10 +29,12 @@ type PartPlanStat struct {
 }
 
 type FlushPlanStat struct {
-	passiveMergeCount  int
-	activeMergeCount   int
+	passiveMergeCount  int // todo
+	activeMergeCount   int // todo
+	delayCompactCount  int
 	totalWriteExpected uint64
 	totalExtraWrite    uint64
+	totalReducedWrite  uint64
 	wt0                []int
 	plans              []PartPlanStat
 }
@@ -43,8 +45,10 @@ var totalWriteExpectedList []uint64
 type FlushPlan struct {
 	passiveMergeCount  int
 	activeMergeCount   int
+	delayCompactCount  int
 	totalWriteExpected uint64
 	totalExtraWrite    uint64
+	totalReducedWrite  uint64
 	wt0                []int // writeTo==0
 	stats              []PartPlanStat
 	planList           []PartPlan
@@ -67,12 +71,17 @@ func planStep1(newKeys []uint64) FlushPlan {
 func plan(newKeys []uint64) FlushPlan {
 	flushPlan := planStep1(newKeys)
 	flushPlan = mergeAdjacent_wt0(flushPlan)
-	if len(flushHistory) > pmtinternal.NoActiveMergeUntil && flushPlan.totalWriteExpected < pmtinternal.ActiveMergeBudgetBytes {
-		extraWriteThreshold := pmtinternal.ActiveMergeBudgetBytes - flushPlan.totalWriteExpected
-		flushPlan = activeMergePlan(flushPlan, extraWriteThreshold)
-		flushPlan = mergeAdjacent_wt0(flushPlan)
+	if len(flushHistory) > pmtinternal.NoActiveMergeUntil {
+		if flushPlan.totalWriteExpected < pmtinternal.WriteThresholdInPages0 {
+			extraWriteThreshold := pmtinternal.WriteThresholdInPages0 - flushPlan.totalWriteExpected
+			flushPlan = activeMergePlan(flushPlan, extraWriteThreshold)
+			flushPlan = mergeAdjacent_wt0(flushPlan)
+		}
+		if flushPlan.totalWriteExpected > pmtinternal.WriteThresholdInPages1 {
+			flushPlan = delaySmallCompaction(flushPlan)
+		}
 	}
-	recordFlushPlan(flushPlan)
+	recordFlushPlan(flushPlan) // todo: 不应该在这里
 	return flushPlan
 }
 
@@ -84,11 +93,12 @@ func step1Simple() FlushPlan {
 	var totalWriteExpected uint64
 	for _, p := range pmtinternal.PartIdx {
 		sp := PartPlan{
-			High:    p.High,
-			low:     p.Low,
-			WriteTo: uint16(len(p.Stack)),
-			Stack:   p.Stack,
-			Outputs: nil,
+			High:     p.High,
+			low:      p.Low,
+			NewPages: 0,
+			WriteTo:  uint16(len(p.Stack)),
+			Stack:    p.Stack,
+			Outputs:  nil,
 		}
 		writeTo := len(sp.Stack)
 		reason := "append_only"
@@ -123,8 +133,10 @@ func step1Simple() FlushPlan {
 	return FlushPlan{
 		passiveMergeCount:  0,
 		activeMergeCount:   0,
+		delayCompactCount:  0,
 		totalWriteExpected: totalWriteExpected,
 		totalExtraWrite:    0,
+		totalReducedWrite:  0,
 		wt0:                collectWt0(pList),
 		stats:              tmp,
 		planList:           pList,
@@ -160,8 +172,10 @@ func step1V1(newKeys []uint64) FlushPlan {
 	return FlushPlan{
 		passiveMergeCount:  0,
 		activeMergeCount:   0,
+		delayCompactCount:  0,
 		totalWriteExpected: totalWriteExpected,
 		totalExtraWrite:    0,
+		totalReducedWrite:  0,
 		wt0:                collectWt0(pList),
 		stats:              tmp,
 		planList:           pList,
@@ -234,8 +248,10 @@ func step1V2(newKeys []uint64) FlushPlan {
 	return FlushPlan{
 		passiveMergeCount:  0,
 		activeMergeCount:   0,
+		delayCompactCount:  0,
 		totalWriteExpected: totalWriteExpected,
 		totalExtraWrite:    0,
+		totalReducedWrite:  0,
 		wt0:                collectWt0(pList),
 		stats:              tmp,
 		planList:           pList,
@@ -258,11 +274,12 @@ func buildStep1V1PartPlan(p pmtinternal.Part, newPages int) (PartPlan, PartPlanS
 	const plan1WriteToBoundary = 4
 
 	sp := PartPlan{
-		High:    p.High,
-		low:     p.Low,
-		WriteTo: uint16(len(p.Stack)),
-		Stack:   p.Stack,
-		Outputs: nil,
+		High:     p.High,
+		low:      p.Low,
+		NewPages: newPages,
+		WriteTo:  uint16(len(p.Stack)),
+		Stack:    p.Stack,
+		Outputs:  nil,
 	}
 	threshold := plan1A*float64(newPages) + plan1B
 	writeTo := len(sp.Stack)
@@ -341,8 +358,10 @@ func recordFlushPlan(flushPlan FlushPlan) {
 	flushHistory = append(flushHistory, FlushPlanStat{
 		passiveMergeCount:  flushPlan.passiveMergeCount,
 		activeMergeCount:   flushPlan.activeMergeCount,
+		delayCompactCount:  flushPlan.delayCompactCount,
 		totalWriteExpected: flushPlan.totalWriteExpected,
 		totalExtraWrite:    flushPlan.totalExtraWrite,
+		totalReducedWrite:  flushPlan.totalReducedWrite,
 		wt0:                wt0,
 		plans:              stats,
 	})
@@ -373,6 +392,7 @@ func mergeAdjacent_wt0(flushPlan FlushPlan) FlushPlan {
 			next := flushPlan.planList[j]
 			// no need to check keyrange
 			cur.High = next.High
+			cur.NewPages += next.NewPages
 			cur.Stack = append(cur.Stack, next.Stack...)
 			curStat = mergePlanStat(curStat, flushPlan.stats[j])
 			passiveMergeCount++
@@ -385,6 +405,51 @@ func mergeAdjacent_wt0(flushPlan FlushPlan) FlushPlan {
 	flushPlan.planList = merged
 	flushPlan.wt0 = collectWt0(merged)
 	flushPlan.stats = mergedStats
+	return flushPlan
+}
+
+func adjustedReasonForWriteToChange(from, to int) string {
+	if from == to {
+		panic("adjustedReasonForWriteToChange: from == to")
+	}
+	if from < to {
+		return fmt.Sprintf("delayFrom%d", from)
+	}
+	return fmt.Sprintf("advanceFrom%d", from)
+}
+
+func delaySmallCompaction(flushPlan FlushPlan) FlushPlan {
+	if len(flushPlan.stats) != len(flushPlan.planList) {
+		panic("len(flushPlan.stats) != len(flushPlan.planList)")
+	}
+	for _, idx := range flushPlan.wt0 {
+		if idx < 0 || idx >= len(flushPlan.planList) {
+			panic("delaySmallCompaction: invalid wt0 idx")
+		}
+		pp := &flushPlan.planList[idx]
+		if pp.WriteTo != 0 {
+			panic("delaySmallCompaction: pp.WriteTo != 0")
+		}
+		if pp.NewPages >= pmtinternal.DelayCompactNewPagesThreshold {
+			continue
+		}
+		reducedWrite := sumStackPagesFrom(pp.Stack, 0)
+		if reducedWrite == 0 {
+			continue
+		}
+		if flushPlan.totalWriteExpected < reducedWrite {
+			panic("delaySmallCompaction: totalWriteExpected underflow")
+		}
+		oldWriteTo := int(pp.WriteTo)
+		newWriteTo := len(pp.Stack)
+		pp.WriteTo = uint16(newWriteTo)
+		flushPlan.stats[idx].WriteTo = pp.WriteTo
+		flushPlan.stats[idx].Reason = adjustedReasonForWriteToChange(oldWriteTo, newWriteTo)
+		flushPlan.totalWriteExpected -= reducedWrite
+		flushPlan.totalReducedWrite += reducedWrite
+		flushPlan.delayCompactCount++
+	}
+	flushPlan.wt0 = collectWt0(flushPlan.planList)
 	return flushPlan
 }
 
@@ -484,9 +549,11 @@ func activeMergePlan(flushPlan FlushPlan, extraWriteThreshold uint64) FlushPlan 
 		if totalExtraWrite+tryPush.extraWrite > extraWriteThreshold {
 			break
 		}
+		oldWriteTo := int(flushPlan.planList[tryPush.ppIdx].WriteTo)
 		flushPlan.wt0 = append(flushPlan.wt0, tryPush.ppIdx)
 		flushPlan.planList[tryPush.ppIdx].WriteTo = 0
 		flushPlan.stats[tryPush.ppIdx].WriteTo = 0
+		flushPlan.stats[tryPush.ppIdx].Reason = adjustedReasonForWriteToChange(oldWriteTo, 0)
 		flushPlan.totalWriteExpected += tryPush.extraWrite
 		totalExtraWrite += tryPush.extraWrite
 		flushPlan.totalExtraWrite += tryPush.extraWrite
@@ -511,13 +578,17 @@ func dumpFlushHistory(startFrom int, path string) {
 		_, err = f.WriteString(fmt.Sprintf(
 			"------totalWriteExpected: %d\n"+
 				"------totalExtraWrite: %d\n"+
+				"------totalReducedWrite: %d\n"+
 				"------passiveMergeCount: %d\n"+
 				"------activeMergeCount: %d\n"+
+				"------delayCompactCount: %d\n"+
 				"------wt0: %v\n",
 			flushHistory[flushID].totalWriteExpected,
 			flushHistory[flushID].totalExtraWrite,
+			flushHistory[flushID].totalReducedWrite,
 			flushHistory[flushID].passiveMergeCount,
 			flushHistory[flushID].activeMergeCount,
+			flushHistory[flushID].delayCompactCount,
 			flushHistory[flushID].wt0,
 		))
 		if err != nil {
@@ -579,11 +650,12 @@ func formatPlanStack(stack []uint64) string {
 }
 
 type PartPlan struct {
-	High    uint64
-	low     uint64 // what use?
-	WriteTo uint16 // 0 means rewrite all, stack.len means just flush no rewrite
-	Stack   []FileNum
-	Outputs []uint64
+	High     uint64
+	low      uint64 // what use?
+	NewPages int
+	WriteTo  uint16 // 0 means rewrite all, stack.len means just flush no rewrite
+	Stack    []FileNum
+	Outputs  []uint64
 }
 
 func newPartIdxFrom(pList []PartPlan) []pmtinternal.Part {

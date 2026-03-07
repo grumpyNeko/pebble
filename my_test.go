@@ -32,8 +32,6 @@ func Test_pmt_basic(t *testing.T) {
 	path := "mem"
 	db := MustDB(path, true, func(options *Options) *Options {
 		pmtinternal.EnablePMTTableFormat = true
-		pmtinternal.ActiveMergeBudgetBytes = 512 * PageSize
-
 		options.FileFormat = sstable.TableFormatPMT0
 		return options
 	})

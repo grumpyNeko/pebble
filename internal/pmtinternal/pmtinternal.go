@@ -19,7 +19,18 @@ const (
 
 var Step1Method = PlanStep1V1
 var Step1V2ChunkSize = 64
-var ActiveMergeBudgetBytes uint64 = 5500 * 4096
+
+// If totalWriteExpected is smaller than this threshold,
+// may advance compaction to help rebalance.
+var WriteThresholdInPages0 uint64 = 5000
+
+// If totalWriteExpected is larger than this threshold,
+// small wt0 compactions may be delayed.
+var WriteThresholdInPages1 uint64 = 5500
+
+// When delaying compaction above WriteThresholdInPages1,
+// only wt0 parts with NewPages smaller than this threshold are delayed.
+var DelayCompactNewPagesThreshold int = 50
 var NoActiveMergeUntil = 64 // 64次multiflush之前不提前压实
 
 func SetStep1Method(m PlanStep1Method) {
@@ -29,17 +40,6 @@ func SetStep1Method(m PlanStep1Method) {
 	default:
 		panic(fmt.Sprintf("SetStep1Method: unknown method %d", m))
 	}
-}
-
-func SetStep1V2ChunkSize(chunkSize int) {
-	if chunkSize <= 0 {
-		panic(fmt.Sprintf("SetStep1V2ChunkSize: invalid chunkSize %d", chunkSize))
-	}
-	Step1V2ChunkSize = chunkSize
-}
-
-func SetActiveMergeBudgetBytes(budgetBytes uint64) {
-	ActiveMergeBudgetBytes = budgetBytes
 }
 
 var PartIdx []Part = []Part{

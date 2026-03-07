@@ -228,7 +228,7 @@ func Test_activeMergePlan(t *testing.T) {
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			pmtinternal.ActiveMergeBudgetBytes = tc.budget
+			pmtinternal.WriteThresholdInPages0 = tc.budget
 			if tc.want.panic != "" {
 				defer func() {
 					r := recover()
