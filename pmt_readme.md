@@ -214,4 +214,17 @@ stack变成[L6,L5,L5], writeTo=2, 写入L4, 但输入中有L5文件
   由于pmt的multilevelflush的输出总是最新的, 直接放L0(最上面), 不会导致老数据掩盖新数据(即使没有seqnum)
 反对? 删旧L0文件+加新L0文件，重建sublevels
 
-pmt把所有文件都放在L0, 给我一个todolist
+DO: 删outputLevelForWriteTo, stack writeTo不再映射Pebble level, multiflush只写L0
+L0按seqnum排序
+panic: L0 files 000140 and 000062 are not properly ordered: <#0-#91> vs <#0-#37>
+可能与L0的特殊顺序有关
+```go
+func newCompactionInputLevelSlice(
+	cmp base.Compare, level int, files []*manifest.TableMetadata,
+) manifest.LevelSlice {
+	if level == 0 {
+		return manifest.NewLevelSliceSeqSorted(files)
+	}
+	return manifest.NewLevelSliceKeySorted(cmp, files)
+}
+```
