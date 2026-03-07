@@ -44,20 +44,6 @@ newPartIdxFrom(pList) []Part {
 注释掉db.flush中的maybeScheduleCompaction
 修改compaction迭代器, 增加memtable
 
-# stack slot 与 pebble level
-outputLevelForWriteTo希望writeTo=0对应L6, writeTo=1对应L5, ...
-但有例外
-stack=[L6,L5,L4], writeTo=1, 写入L5, 产生两个文件                               
-stack变成[L6,L5,L5], writeTo=2, 写入L4, 但输入中有L5文件
-此时slot与Level不是一一对应
-
-怎么办 
-- stack的元素改为[]FileNum
-- outputLevel=max(outputLevelForWriteTo(writeTo),maxInputLevel), 这是不对的
-- []FileNum + []SlotID的改动更小
-
-如果stack的元素改为[]FileNum, 会对其他代码有影响: todo
-
 # TableFormatPebblev6比v1小   
 columnarblock，把key/trailer/value分列编码，固定长度数据省开销
   Header                                                                                                                                                                                                                                          
@@ -118,8 +104,7 @@ DB.Get 初始化 getIter 时注入 newIters: d.newIters，见 db.go:602。
 getIter 在 getSSTableIterators:263 调 g.newIters(..., iterPointKeys|iterRangeDeletions)。
 PMT 分流后同样进入 newPMTIters:15，point 直接是 pmtformat.Iter，不再经过 pmtTableReader/pmtformat.Reader。
 
-# TableFormatPMT读路径接入BlockCache
-
+# TableFormatPMT读接入BlockCache
 其他tableformat涉及sstable.Reader/block.Reader, not pmt
 why? pmt没有footer/metaindex/index/properties
 没有tableCache和blockCache
@@ -209,3 +194,24 @@ TODO
 提前压实, 但是prev和succ哪个更适合改为writeTo=0?
 activeMergePlan, totalExtraWrite, ..很多名字不太好, 统计方式也次优
 wt0改成map, 不要多次collectWt0而是随时维护wt0
+
+# stack slot 与 pebble level
+outputLevelForWriteTo希望writeTo=0对应L6, writeTo=1对应L5, ...
+但有例外
+stack=[L6,L5,L4], writeTo=1, 写入L5, 产生两个文件                               
+stack变成[L6,L5,L5], writeTo=2, 写入L4, 但输入中有L5文件
+此时slot与Level不是一一对应
+
+怎么办 
+- outputLevel=max(outputLevelForWriteTo(writeTo),maxInputLevel), 这是不对的
+- stack的元素改为[]FileNum
+- []FileNum + []SlotID的改动更小
+
+把stack的元素改为[]FileNum也不行, pebble的Level只有7层, 改manifest.NumLevels容易出问题
+如果stack的元素改为[]FileNum, 会对其他代码有影响
+如果pmt把所有文件都放在L0会怎样
+  L0有sublevel数量可以设置
+  由于pmt的multilevelflush的输出总是最新的, 直接放L0(最上面), 不会导致老数据掩盖新数据(即使没有seqnum)
+反对? 删旧L0文件+加新L0文件，重建sublevels
+
+pmt把所有文件都放在L0, 给我一个todolist

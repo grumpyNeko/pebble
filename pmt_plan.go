@@ -3,6 +3,7 @@ package pebble
 import (
 	"fmt"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/pmtinternal"
 	"math"
 	"os"
@@ -14,9 +15,8 @@ import (
 )
 
 const (
-	KVPerPage   = 4096 / 16
-	PageSize    = 4096
-	MaxStackLen = 7
+	KVPerPage = 4096 / 16
+	PageSize  = 4096
 )
 
 type PartPlanStat struct {
@@ -106,8 +106,8 @@ func step1Simple() FlushPlan {
 			writeTo = 0
 			reason = "stack_len_reach_threshold"
 		}
-		if writeTo >= MaxStackLen {
-			panic("writeTo >= MaxStackLen")
+		if writeTo >= manifest.NumLevels {
+			panic(fmt.Sprintf("writeTo >= manifest.NumLevels"))
 		}
 		sp.WriteTo = uint16(writeTo)
 		totalWriteExpected += sumStackPagesFrom(sp.Stack, int(sp.WriteTo))
@@ -305,8 +305,8 @@ func buildStep1V1PartPlan(p pmtinternal.Part, newPages int) (PartPlan, PartPlanS
 		writeTo--
 		reason = "reach_cap"
 	}
-	if writeTo >= MaxStackLen {
-		panic("writeTo >= MaxStackLen")
+	if writeTo >= manifest.NumLevels {
+		panic("writeTo >= manifest.NumLevels")
 	}
 	sp.WriteTo = uint16(writeTo)
 	writeExpected := uint64(newPages) + sumStackPagesFrom(sp.Stack, int(sp.WriteTo))

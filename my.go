@@ -143,7 +143,7 @@ func pmtOptions() *Options {
 	opts.MaxConcurrentCompactions = func() int { return 8 }
 	const pagesize = 4096
 	opts.CacheSize = 256 * pagesize
-	opts.Levels = make([]LevelOptions, 7)
+	opts.Levels = make([]LevelOptions, manifest.NumLevels)
 	for i := range opts.Levels {
 		opts.Levels[i].BlockRestartInterval = 1
 		opts.Levels[i].Compression = func() Compression {

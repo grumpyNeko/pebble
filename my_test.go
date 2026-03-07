@@ -452,6 +452,7 @@ func Test_pmt_wa(t *testing.T) {
 		return options
 	})
 	defer SavePMTPartIdx(filepath.Join(path, "partidx.json"))
+	defer dumpFlushHistory(0, filepath.Join(path, "flushhistory"))
 
 	const flushConcurrency = 2
 	times := 128 // 128
@@ -476,10 +477,8 @@ func Test_pmt_wa(t *testing.T) {
 		pmtinternal.PartIdx = newPartIdxFrom(flushPlan.planList) // TODO: 不是通过CompactionEnd/FlushEnd更新PartIdx
 		println(fmt.Sprintf("done %d", i))
 	}
-	SavePMTPartIdx(filepath.Join(path, "partidx.json"))
-	println(fmt.Sprintf("写入阶段耗时(ms): %d", time.Since(writeStart).Milliseconds()))
 
-	dumpFlushHistory(125, filepath.Join(path, "flushhistory"))
+	println(fmt.Sprintf("写入阶段耗时(ms): %d", time.Since(writeStart).Milliseconds()))
 
 	metrics := stat(db)
 	use(metrics)
