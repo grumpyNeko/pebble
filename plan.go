@@ -372,7 +372,7 @@ func passiveMergePlan(flushPlan FlushPlan) FlushPlan {
 	return ret
 }
 
-func activeMergePlan(list []PartPlan) []PartPlan {
+func activeMergePlan(flushPlan FlushPlan) FlushPlan {
 	// todo: ...
 	return nil
 }
