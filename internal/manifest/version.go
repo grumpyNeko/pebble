@@ -1205,7 +1205,7 @@ func SortBySmallest(files []*TableMetadata, cmp Compare) {
 }
 
 // NumLevels is the number of levels a Version contains.
-const NumLevels = 16 // 原先是7, 但是对于pmt来说不够用
+const NumLevels = 7 // 7对pmt来说不太够用
 
 // NewVersion constructs a new Version with the provided files. It requires
 // the provided files are already well-ordered. It's intended for testing.

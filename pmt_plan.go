@@ -77,9 +77,10 @@ func plan(newKeys []uint64) FlushPlan {
 			flushPlan = activeMergePlan(flushPlan, extraWriteThreshold)
 			flushPlan = mergeAdjacent_wt0(flushPlan)
 		}
-		if flushPlan.totalWriteExpected > pmtinternal.WriteThresholdInPages1 {
-			flushPlan = delaySmallCompaction(flushPlan)
-		}
+		// todo: 推迟也不能只追加啊
+		//if flushPlan.totalWriteExpected > pmtinternal.WriteThresholdInPages1 {
+		//	flushPlan = delaySmallCompaction(flushPlan)
+		//}
 	}
 	recordFlushPlan(flushPlan) // todo: 不应该在这里
 	return flushPlan
@@ -432,6 +433,9 @@ func delaySmallCompaction(flushPlan FlushPlan) FlushPlan {
 		}
 		if pp.NewPages >= pmtinternal.DelayCompactNewPagesThreshold {
 			continue
+		}
+		if len(pp.Stack) >= manifest.NumLevels {
+			panic("writeTo would be too large")
 		}
 		reducedWrite := sumStackPagesFrom(pp.Stack, 0)
 		if reducedWrite == 0 {
