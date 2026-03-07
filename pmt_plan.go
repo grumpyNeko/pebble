@@ -29,22 +29,25 @@ type PartPlanStat struct {
 }
 
 type FlushPlanStat struct {
-	passiveMergeCount       int
-	activeMergeCount        int
-	step1TotalWriteExpected uint64
-	step2TotalWriteExpected uint64
-	plans                   []PartPlanStat
+	passiveMergeCount  int
+	activeMergeCount   int
+	totalWriteExpected uint64
+	totalExtraWrite    uint64
+	wt0                []int
+	plans              []PartPlanStat
 }
 
 var flushHistory []FlushPlanStat
-var step2TotalWriteExpectedList []uint64
+var totalWriteExpectedList []uint64
 
 type FlushPlan struct {
-	passiveMergeCount       int
-	activeMergeCount        int
-	step1TotalWriteExpected uint64
-	step2TotalWriteExpected uint64
-	planList                []PartPlan
+	passiveMergeCount  int
+	activeMergeCount   int
+	totalWriteExpected uint64
+	totalExtraWrite    uint64
+	wt0                []int // writeTo==0
+	stats              []PartPlanStat
+	planList           []PartPlan
 }
 
 // todo: 改成并发的
@@ -61,12 +64,24 @@ func planStep1(newKeys []uint64) FlushPlan {
 	}
 }
 
+func plan(newKeys []uint64) FlushPlan {
+	flushPlan := planStep1(newKeys)
+	flushPlan = mergeAdjacent_wt0(flushPlan)
+	if len(flushHistory) > pmtinternal.NoActiveMergeUntil && flushPlan.totalWriteExpected < pmtinternal.ActiveMergeBudgetBytes {
+		extraWriteThreshold := pmtinternal.ActiveMergeBudgetBytes - flushPlan.totalWriteExpected
+		flushPlan = activeMergePlan(flushPlan, extraWriteThreshold)
+		flushPlan = mergeAdjacent_wt0(flushPlan)
+	}
+	recordFlushPlan(flushPlan)
+	return flushPlan
+}
+
 func step1Simple() FlushPlan {
 	const threshold = 3
 
 	pList := make([]PartPlan, 0, 256)
 	tmp := make([]PartPlanStat, 0, len(pmtinternal.PartIdx))
-	var step1TotalWriteExpected uint64
+	var totalWriteExpected uint64
 	for _, p := range pmtinternal.PartIdx {
 		sp := PartPlan{
 			High:    p.High,
@@ -85,7 +100,7 @@ func step1Simple() FlushPlan {
 			panic("writeTo >= MaxStackLen")
 		}
 		sp.WriteTo = uint16(writeTo)
-		step1TotalWriteExpected += sumStackPagesFrom(sp.Stack, int(sp.WriteTo))
+		totalWriteExpected += sumStackPagesFrom(sp.Stack, int(sp.WriteTo))
 		stack := make([]uint64, 0, len(sp.Stack))
 		for _, fn := range sp.Stack {
 			info, ok := pmtinternal.SstMap[uint64(fn)]
@@ -105,19 +120,14 @@ func step1Simple() FlushPlan {
 		pList = append(pList, sp)
 	}
 
-	flushHistory = append(flushHistory, FlushPlanStat{
-		passiveMergeCount:       0,
-		activeMergeCount:        0,
-		step1TotalWriteExpected: step1TotalWriteExpected,
-		step2TotalWriteExpected: step1TotalWriteExpected,
-		plans:                   tmp,
-	})
 	return FlushPlan{
-		passiveMergeCount:       0,
-		activeMergeCount:        0,
-		step1TotalWriteExpected: step1TotalWriteExpected,
-		step2TotalWriteExpected: step1TotalWriteExpected,
-		planList:                pList,
+		passiveMergeCount:  0,
+		activeMergeCount:   0,
+		totalWriteExpected: totalWriteExpected,
+		totalExtraWrite:    0,
+		wt0:                collectWt0(pList),
+		stats:              tmp,
+		planList:           pList,
 	}
 }
 
@@ -125,7 +135,7 @@ func step1V1(newKeys []uint64) FlushPlan {
 	parts := pmtinternal.PartIdx
 	pList := make([]PartPlan, 0, len(parts))
 	tmp := make([]PartPlanStat, 0, len(parts))
-	var step1TotalWriteExpected uint64
+	var totalWriteExpected uint64
 
 	// Two pointers over sorted newKeys + sorted PartIdx range to get O(P+N).
 	keyL, keyR := 0, 0
@@ -142,24 +152,19 @@ func step1V1(newKeys []uint64) FlushPlan {
 		newKVCount := keyR - keyL
 		newPages := (newKVCount + KVPerPage - 1) / KVPerPage
 		sp, stat, writeExpected := buildStep1V1PartPlan(p, newPages)
-		step1TotalWriteExpected += writeExpected
+		totalWriteExpected += writeExpected
 		tmp = append(tmp, stat)
 		pList = append(pList, sp)
 	}
 
-	flushHistory = append(flushHistory, FlushPlanStat{
-		passiveMergeCount:       0,
-		activeMergeCount:        0,
-		step1TotalWriteExpected: step1TotalWriteExpected,
-		step2TotalWriteExpected: step1TotalWriteExpected,
-		plans:                   tmp,
-	})
 	return FlushPlan{
-		passiveMergeCount:       0,
-		activeMergeCount:        0,
-		step1TotalWriteExpected: step1TotalWriteExpected,
-		step2TotalWriteExpected: step1TotalWriteExpected,
-		planList:                pList,
+		passiveMergeCount:  0,
+		activeMergeCount:   0,
+		totalWriteExpected: totalWriteExpected,
+		totalExtraWrite:    0,
+		wt0:                collectWt0(pList),
+		stats:              tmp,
+		planList:           pList,
 	}
 }
 
@@ -221,25 +226,30 @@ func step1V2(newKeys []uint64) FlushPlan {
 	}
 	wg.Wait()
 
-	var step1TotalWriteExpected uint64
+	var totalWriteExpected uint64
 	for _, v := range workerWriteExpected {
-		step1TotalWriteExpected += v
+		totalWriteExpected += v
 	}
 
-	flushHistory = append(flushHistory, FlushPlanStat{
-		passiveMergeCount:       0,
-		activeMergeCount:        0,
-		step1TotalWriteExpected: step1TotalWriteExpected,
-		step2TotalWriteExpected: step1TotalWriteExpected,
-		plans:                   tmp,
-	})
 	return FlushPlan{
-		passiveMergeCount:       0,
-		activeMergeCount:        0,
-		step1TotalWriteExpected: step1TotalWriteExpected,
-		step2TotalWriteExpected: step1TotalWriteExpected,
-		planList:                pList,
+		passiveMergeCount:  0,
+		activeMergeCount:   0,
+		totalWriteExpected: totalWriteExpected,
+		totalExtraWrite:    0,
+		wt0:                collectWt0(pList),
+		stats:              tmp,
+		planList:           pList,
 	}
+}
+
+func collectWt0(planList []PartPlan) []int {
+	ret := make([]int, 0, len(planList))
+	for i := range planList {
+		if planList[i].WriteTo == 0 {
+			ret = append(ret, i)
+		}
+	}
+	return ret
 }
 
 func buildStep1V1PartPlan(p pmtinternal.Part, newPages int) (PartPlan, PartPlanStat, uint64) {
@@ -303,13 +313,13 @@ func buildStep1V1PartPlan(p pmtinternal.Part, newPages int) (PartPlan, PartPlanS
 
 func sumStackPagesFrom(stack []FileNum, from int) uint64 {
 	if from < 0 || from > len(stack) {
-		panic("sumStackPagesFrom: invalid from")
+		panic("invalid from")
 	}
 	var pages uint64
 	for i := from; i < len(stack); i++ {
 		info, ok := pmtinternal.SstMap[uint64(stack[i])]
 		if !ok {
-			panic(fmt.Sprintf("sumStackPagesFrom: file %d not found in SstMap", stack[i]))
+			panic(fmt.Sprintf("file %d not found in SstMap", stack[i]))
 		}
 		pages += sstSizeInPages(info.Size)
 	}
@@ -323,30 +333,38 @@ func sstSizeInPages(size uint64) uint64 {
 	return (size + uint64(PageSize) - 1) / uint64(PageSize)
 }
 
-func recordFlushPlanStep2(flushPlan FlushPlan) {
-	step2TotalWriteExpectedList = append(step2TotalWriteExpectedList, flushPlan.step2TotalWriteExpected)
-	if len(flushHistory) == 0 {
-		return
-	}
-	last := len(flushHistory) - 1
-	flushHistory[last].passiveMergeCount = flushPlan.passiveMergeCount
-	flushHistory[last].activeMergeCount = flushPlan.activeMergeCount
-	flushHistory[last].step2TotalWriteExpected = flushPlan.step2TotalWriteExpected
+func recordFlushPlan(flushPlan FlushPlan) {
+	totalWriteExpectedList = append(totalWriteExpectedList, flushPlan.totalWriteExpected)
+	wt0 := append([]int(nil), flushPlan.wt0...)
+	stats := make([]PartPlanStat, len(flushPlan.stats))
+	copy(stats, flushPlan.stats)
+	flushHistory = append(flushHistory, FlushPlanStat{
+		passiveMergeCount:  flushPlan.passiveMergeCount,
+		activeMergeCount:   flushPlan.activeMergeCount,
+		totalWriteExpected: flushPlan.totalWriteExpected,
+		totalExtraWrite:    flushPlan.totalExtraWrite,
+		wt0:                wt0,
+		plans:              stats,
+	})
 }
 
-func passiveMergePlan(flushPlan FlushPlan) FlushPlan {
-	flushPlan.step2TotalWriteExpected = flushPlan.step1TotalWriteExpected
-	if len(flushPlan.planList) < 2 {
-		recordFlushPlanStep2(flushPlan)
-		return flushPlan
-	}
+func mergePlanStat(cur PartPlanStat, next PartPlanStat) PartPlanStat {
+	cur.PartHigh = next.PartHigh
+	cur.NewPages += next.NewPages
+	cur.Stack = append(cur.Stack, next.Stack...)
+	return cur
+}
 
+func mergeAdjacent_wt0(flushPlan FlushPlan) FlushPlan {
 	merged := make([]PartPlan, 0, len(flushPlan.planList))
+	mergedStats := make([]PartPlanStat, 0, len(flushPlan.stats))
 	passiveMergeCount := 0
 	for i := 0; i < len(flushPlan.planList); { // 双指针
 		cur := flushPlan.planList[i]
+		curStat := flushPlan.stats[i]
 		if cur.WriteTo != 0 {
 			merged = append(merged, cur)
+			mergedStats = append(mergedStats, curStat)
 			i++
 			continue
 		}
@@ -356,25 +374,126 @@ func passiveMergePlan(flushPlan FlushPlan) FlushPlan {
 			// no need to check keyrange
 			cur.High = next.High
 			cur.Stack = append(cur.Stack, next.Stack...)
+			curStat = mergePlanStat(curStat, flushPlan.stats[j])
 			passiveMergeCount++
 		}
 		merged = append(merged, cur)
+		mergedStats = append(mergedStats, curStat)
 		i = j
 	}
-	ret := FlushPlan{
-		passiveMergeCount:       flushPlan.passiveMergeCount + passiveMergeCount,
-		activeMergeCount:        flushPlan.activeMergeCount,
-		step1TotalWriteExpected: flushPlan.step1TotalWriteExpected,
-		step2TotalWriteExpected: flushPlan.step1TotalWriteExpected,
-		planList:                merged,
-	}
-	recordFlushPlanStep2(ret)
-	return ret
+	flushPlan.passiveMergeCount += passiveMergeCount
+	flushPlan.planList = merged
+	flushPlan.wt0 = collectWt0(merged)
+	flushPlan.stats = mergedStats
+	return flushPlan
 }
 
-func activeMergePlan(flushPlan FlushPlan) FlushPlan {
-	// todo: ...
-	return nil
+// todo: 不一定要把pp.WriteTo提前到0
+func extraWriteExpected(pp PartPlan) uint64 {
+	if int(pp.WriteTo) > len(pp.Stack) {
+		panic("pp.WriteTo > len(pp.Stack)")
+	}
+	if pp.WriteTo == 0 {
+		panic("pp.WriteTo == 0")
+	}
+	return sumStackPagesFrom(pp.Stack, 0) - sumStackPagesFrom(pp.Stack, int(pp.WriteTo))
+}
+
+func chooseTryPushIdx(flushPlan FlushPlan, wt0Idx int, wt0Set map[int]struct{}) (int, uint64, bool) {
+	prevIdx, hasPrev := wt0Idx-1, wt0Idx > 0
+	succIdx, hasSucc := wt0Idx+1, wt0Idx+1 < len(flushPlan.planList)
+	if !hasPrev && !hasSucc {
+		return 0, 0, false
+	}
+	if !hasPrev {
+		if _, ok := wt0Set[succIdx]; ok {
+			panic("chooseTryPushIdx: succ in wt0")
+		}
+		return succIdx, extraWriteExpected(flushPlan.planList[succIdx]), true
+	}
+	if !hasSucc {
+		if _, ok := wt0Set[prevIdx]; ok {
+			panic("chooseTryPushIdx: prev in wt0")
+		}
+		return prevIdx, extraWriteExpected(flushPlan.planList[prevIdx]), true
+	}
+	if _, ok := wt0Set[prevIdx]; ok {
+		panic("chooseTryPushIdx: prev in wt0")
+	}
+	if _, ok := wt0Set[succIdx]; ok {
+		panic("chooseTryPushIdx: succ in wt0")
+	}
+	prevWrite := extraWriteExpected(flushPlan.planList[prevIdx])
+	succWrite := extraWriteExpected(flushPlan.planList[succIdx])
+	if prevWrite < succWrite {
+		return prevIdx, prevWrite, true
+	}
+	return succIdx, succWrite, true
+}
+
+func activeMergePlan(flushPlan FlushPlan, extraWriteThreshold uint64) FlushPlan {
+	if flushPlan.wt0 == nil {
+		panic("flushPlan.wt0 == nil")
+	}
+	if len(flushPlan.stats) != len(flushPlan.planList) {
+		panic("len(flushPlan.stats) != len(flushPlan.planList)")
+	}
+	if len(flushPlan.planList) <= 1 {
+		return flushPlan
+	}
+	if extraWriteThreshold == 0 {
+		return flushPlan
+	}
+
+	type tryPushCandidate struct {
+		ppIdx      int
+		extraWrite uint64
+	}
+	wt0Set := make(map[int]struct{}, len(flushPlan.wt0))
+	for _, idx := range flushPlan.wt0 {
+		wt0Set[idx] = struct{}{}
+	}
+	tryPushMap := make(map[int]tryPushCandidate, len(flushPlan.wt0))
+	tryPushList := make([]tryPushCandidate, 0, len(flushPlan.wt0))
+	for _, wt0Idx := range flushPlan.wt0 {
+		tryPushIdx, extraWrite, ok := chooseTryPushIdx(flushPlan, wt0Idx, wt0Set)
+		if !ok {
+			continue
+		}
+		if _, exists := wt0Set[tryPushIdx]; exists {
+			panic("activeMergePlan: tryPush in wt0")
+		}
+		if _, exists := tryPushMap[tryPushIdx]; exists {
+			continue
+		}
+		candidate := tryPushCandidate{
+			ppIdx:      tryPushIdx,
+			extraWrite: extraWrite,
+		}
+		tryPushMap[tryPushIdx] = candidate
+		tryPushList = append(tryPushList, candidate)
+	}
+	sort.Slice(tryPushList, func(i, j int) bool {
+		if tryPushList[i].extraWrite != tryPushList[j].extraWrite {
+			return tryPushList[i].extraWrite < tryPushList[j].extraWrite
+		}
+		return tryPushList[i].ppIdx < tryPushList[j].ppIdx
+	})
+	totalExtraWrite := uint64(0)
+	for _, tryPush := range tryPushList {
+		if totalExtraWrite+tryPush.extraWrite > extraWriteThreshold {
+			break
+		}
+		flushPlan.wt0 = append(flushPlan.wt0, tryPush.ppIdx)
+		flushPlan.planList[tryPush.ppIdx].WriteTo = 0
+		flushPlan.stats[tryPush.ppIdx].WriteTo = 0
+		flushPlan.totalWriteExpected += tryPush.extraWrite
+		totalExtraWrite += tryPush.extraWrite
+		flushPlan.totalExtraWrite += tryPush.extraWrite
+		flushPlan.activeMergeCount++
+	}
+	sort.Ints(flushPlan.wt0)
+	return flushPlan
 }
 
 func dumpFlushHistory(startFrom int, path string) {
@@ -390,14 +509,16 @@ func dumpFlushHistory(startFrom int, path string) {
 			panic(err)
 		}
 		_, err = f.WriteString(fmt.Sprintf(
-			"------step1TotalWriteExpected: %d\n"+
-				"------step2TotalWriteExpected: %d\n"+
+			"------totalWriteExpected: %d\n"+
+				"------totalExtraWrite: %d\n"+
 				"------passiveMergeCount: %d\n"+
-				"------activeMergeCount: %d\n",
-			flushHistory[flushID].step1TotalWriteExpected,
-			flushHistory[flushID].step2TotalWriteExpected,
+				"------activeMergeCount: %d\n"+
+				"------wt0: %v\n",
+			flushHistory[flushID].totalWriteExpected,
+			flushHistory[flushID].totalExtraWrite,
 			flushHistory[flushID].passiveMergeCount,
 			flushHistory[flushID].activeMergeCount,
+			flushHistory[flushID].wt0,
 		))
 		if err != nil {
 			_ = f.Close()
@@ -421,9 +542,9 @@ func dumpFlushHistory(startFrom int, path string) {
 
 func printTotalWriteExpectedList() {
 	var b strings.Builder
-	b.WriteString("step2TotalWriteExpectedList=[")
+	b.WriteString("totalWriteExpectedList=[")
 	var sum uint64
-	for i, v := range step2TotalWriteExpectedList {
+	for i, v := range totalWriteExpectedList {
 		if i > 0 {
 			b.WriteString(",")
 		}
@@ -432,12 +553,12 @@ func printTotalWriteExpectedList() {
 	}
 	b.WriteString("]")
 	println(b.String())
-	if len(step2TotalWriteExpectedList) == 0 {
-		println("avgstep2TotalWrite=0")
+	if len(totalWriteExpectedList) == 0 {
+		println("avgTotalWrite=0")
 		return
 	}
-	avg := float64(sum) / float64(len(step2TotalWriteExpectedList))
-	println(fmt.Sprintf("avgstep2TotalWrite=%.2f", avg))
+	avg := float64(sum) / float64(len(totalWriteExpectedList))
+	println(fmt.Sprintf("avgTotalWrite=%.2f", avg))
 }
 
 // [1000,500,155,100]

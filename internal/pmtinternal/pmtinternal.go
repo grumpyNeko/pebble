@@ -19,6 +19,8 @@ const (
 
 var Step1Method = PlanStep1V1
 var Step1V2ChunkSize = 64
+var ActiveMergeBudgetBytes uint64 = 5500 * 4096
+var NoActiveMergeUntil = 64 // 64次multiflush之前不提前压实
 
 func SetStep1Method(m PlanStep1Method) {
 	switch m {
@@ -34,6 +36,10 @@ func SetStep1V2ChunkSize(chunkSize int) {
 		panic(fmt.Sprintf("SetStep1V2ChunkSize: invalid chunkSize %d", chunkSize))
 	}
 	Step1V2ChunkSize = chunkSize
+}
+
+func SetActiveMergeBudgetBytes(budgetBytes uint64) {
+	ActiveMergeBudgetBytes = budgetBytes
 }
 
 var PartIdx []Part = []Part{

@@ -155,3 +155,18 @@ pmt怎么加tableCache
 - 给 fileCacheValue 增加 PMT reader 形态（或通用 Readable 字段），见 file_cache.go:881。                                                                                                                                                     
 - newPMTIters 从 cached value 创建 iter，并用 closeHook 做 Unref，避免每次打开文件。     
 
+# 压实前先生成计划
+```
+plan(keys)
+	flushPlan = planStep1(keys)
+	flushPlan = mergeAdjacent_wt0(flushPlan)
+	if flushPlan.totalWriteExpected < **
+		flushPlan = activeMergePlan(flushPlan, extraWriteThreshold)
+		flushPlan = mergeAdjacent_wt0(flushPlan)
+	recordFlushPlan to flushhistory
+	return flushPlan
+```
+
+extraWriteThreshold是? ..
+NoActiveMergeUntil是? 开始没数据, 不要提前压实
+

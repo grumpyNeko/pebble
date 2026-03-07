@@ -28,100 +28,22 @@ import (
 
 const datasetPath = "ww/dataset"
 
-// writeBarrierFS blocks the first write to each sstable until N writers arrive.
-// This is a focused way to prove concurrent "write to disk" overlap.
-type writeBarrierFS struct {
-	vfs.FS
-	b *writeBarrier
-}
-
-type writeBarrier struct {
-	target int32
-	count  int32
-	ch     chan struct{}
-	once   sync.Once
-}
-
-func newWriteBarrier(target int32) *writeBarrier {
-	return &writeBarrier{
-		target: target,
-		ch:     make(chan struct{}),
-	}
-}
-
-func (b *writeBarrier) arriveAndWait() {
-	if atomic.AddInt32(&b.count, 1) == b.target {
-		b.once.Do(func() { close(b.ch) })
-	}
-	<-b.ch
-}
-
-type barrierFile struct {
-	vfs.File
-	b    *writeBarrier
-	once sync.Once
-}
-
-func (f *barrierFile) waitOnce() {
-	f.once.Do(func() { f.b.arriveAndWait() })
-}
-
-func (fs *writeBarrierFS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, error) {
-	f, err := fs.FS.Create(name, category)
-	if err != nil {
-		return nil, err
-	}
-	if strings.HasSuffix(name, ".sst") {
-		return &barrierFile{File: f, b: fs.b}, nil
-	}
-	return f, nil
-}
-
-func (fs *writeBarrierFS) ReuseForWrite(
-	oldname, newname string, category vfs.DiskWriteCategory,
-) (vfs.File, error) {
-	f, err := fs.FS.ReuseForWrite(oldname, newname, category)
-	if err != nil {
-		return nil, err
-	}
-	if strings.HasSuffix(newname, ".sst") {
-		return &barrierFile{File: f, b: fs.b}, nil
-	}
-	return f, nil
-}
-
-func (f *barrierFile) Write(p []byte) (int, error) {
-	f.waitOnce()
-	return f.File.Write(p)
-}
-
-func (f *barrierFile) WriteAt(p []byte, ofs int64) (int, error) {
-	f.waitOnce()
-	return f.File.WriteAt(p, ofs)
-}
-
-/*
-老代码暂时保留
-batchWrite(db, []uint64{2, 10}, 0)
-batchWrite(db, []uint64{15, 99}, 0)
-batchWrite(db, []uint64{1, 20}, 0)
-println(db.LSMViewURL())
-db.manualCompact(BigEndian(2), BigEndian(10), 0, false)
-println(db.LSMViewURL())
-*/
 func Test_pmt_basic(t *testing.T) {
-	db := MustDB("tmp_db/pmt_basic", true, func(options *Options) *Options {
+	path := "mem"
+	db := MustDB(path, true, func(options *Options) *Options {
 		pmtinternal.EnablePMTTableFormat = true
+		pmtinternal.ActiveMergeBudgetBytes = 512 * PageSize
+
 		options.FileFormat = sstable.TableFormatPMT0
 		return options
 	})
 	defer db.Close()
+	defer SavePMTPartIdx(filepath.Join(path, "partidx.json"))
 
-	path := filepath.Join(datasetPath, "normal_plus_round_000.bin")
-	d := LoadDataFile(path)
+	d := LoadDataFile(filepath.Join(datasetPath, "normal_plus_round_000.bin"))
 	keys := d.Keys
 
-	flushPlan := planStep1(keys)
+	flushPlan := plan(keys)
 	multilevelFlushConcurrent(db, keys, uint64(17), flushPlan.planList, 2)
 	pmtinternal.PartIdx = newPartIdxFrom(flushPlan.planList)
 
@@ -544,9 +466,7 @@ func Test_pmt_wa(t *testing.T) {
 	writeStart := time.Now()
 	for i := 0; i < times; i++ {
 		keys := datas[i<<20 : (i+1)<<20]
-		flushPlan := planStep1(keys)
-		flushPlan = passiveMergePlan(flushPlan) // current testing
-
+		flushPlan := plan(keys)
 		//for j, sp := range pList {
 		//	mem := fakeMemTable{
 		//		keys: rangeLimit(d.Keys, sp.low, sp.High),
@@ -561,7 +481,7 @@ func Test_pmt_wa(t *testing.T) {
 	SavePMTPartIdx(filepath.Join(path, "partidx.json"))
 	println(fmt.Sprintf("写入阶段耗时(ms): %d", time.Since(writeStart).Milliseconds()))
 
-	//dumpFlushHistory(126, "ww/flushhistory")
+	dumpFlushHistory(125, filepath.Join(path, "flushhistory"))
 
 	metrics := stat(db)
 	use(metrics)
@@ -1111,7 +1031,7 @@ func Test_multilevelFlush_pprof(t *testing.T) {
 	for r := 0; r < rounds; r++ {
 		path := filepath.Join(dir, fmt.Sprintf("normal_plus_round_%03d.bin", r))
 		d := LoadDataFile(path)
-		flushPlan := planStep1(d.Keys)
+		flushPlan := plan(d.Keys)
 		multilevelFlushConcurrent(db, d.Keys, uint64(r), flushPlan.planList, flushConcurrency)
 		pmtinternal.PartIdx = newPartIdxFrom(flushPlan.planList)
 	}
@@ -1281,4 +1201,76 @@ func Test_PMT_Format_Performance(t *testing.T) {
 	t.Logf("pmtformat size: %d bytes", pmtSize)
 	t.Logf("oldformat(v1, no compression) size: %d bytes", oldSize)
 	t.Logf("size ratio (pmt/old): %.4f", ratio)
+}
+
+// ===========================================================
+// to prove concurrent "write to disk" overlap.
+type writeBarrierFS struct {
+	vfs.FS
+	b *writeBarrier
+}
+
+type writeBarrier struct {
+	target int32
+	count  int32
+	ch     chan struct{}
+	once   sync.Once
+}
+
+func newWriteBarrier(target int32) *writeBarrier {
+	return &writeBarrier{
+		target: target,
+		ch:     make(chan struct{}),
+	}
+}
+
+func (b *writeBarrier) arriveAndWait() {
+	if atomic.AddInt32(&b.count, 1) == b.target {
+		b.once.Do(func() { close(b.ch) })
+	}
+	<-b.ch
+}
+
+type barrierFile struct {
+	vfs.File
+	b    *writeBarrier
+	once sync.Once
+}
+
+func (f *barrierFile) waitOnce() {
+	f.once.Do(func() { f.b.arriveAndWait() })
+}
+
+func (fs *writeBarrierFS) Create(name string, category vfs.DiskWriteCategory) (vfs.File, error) {
+	f, err := fs.FS.Create(name, category)
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasSuffix(name, ".sst") {
+		return &barrierFile{File: f, b: fs.b}, nil
+	}
+	return f, nil
+}
+
+func (fs *writeBarrierFS) ReuseForWrite(
+	oldname, newname string, category vfs.DiskWriteCategory,
+) (vfs.File, error) {
+	f, err := fs.FS.ReuseForWrite(oldname, newname, category)
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasSuffix(newname, ".sst") {
+		return &barrierFile{File: f, b: fs.b}, nil
+	}
+	return f, nil
+}
+
+func (f *barrierFile) Write(p []byte) (int, error) {
+	f.waitOnce()
+	return f.File.Write(p)
+}
+
+func (f *barrierFile) WriteAt(p []byte, ofs int64) (int, error) {
+	f.waitOnce()
+	return f.File.WriteAt(p, ofs)
 }
