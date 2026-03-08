@@ -50,7 +50,6 @@ type FlushPlan struct {
 	totalExtraWrite    uint64
 	totalReducedWrite  uint64
 	wt0                []int // writeTo==0
-	stats              []PartPlanStat
 	planList           []PartPlan
 }
 
@@ -63,6 +62,10 @@ func planStep1(newKeys []uint64) FlushPlan {
 		return step1V1(newKeys)
 	case pmtinternal.PlanStep1V2:
 		return step1V2(newKeys)
+	case pmtinternal.PlanStep1V3:
+		return step1V3(newKeys)
+	case pmtinternal.PlanStep1V4:
+		return step1V4(newKeys)
 	default:
 		panic(fmt.Sprintf("planStep1: unknown step1 method %d", pmtinternal.Step1Method))
 	}
@@ -90,7 +93,6 @@ func step1Simple() FlushPlan {
 	const threshold = 3
 
 	pList := make([]PartPlan, 0, 256)
-	tmp := make([]PartPlanStat, 0, len(pmtinternal.PartIdx))
 	var totalWriteExpected uint64
 	for _, p := range pmtinternal.PartIdx {
 		sp := PartPlan{
@@ -111,23 +113,8 @@ func step1Simple() FlushPlan {
 			panic(fmt.Sprintf("writeTo >= manifest.NumLevels"))
 		}
 		sp.WriteTo = uint16(writeTo)
+		sp.Reason = reason
 		totalWriteExpected += sumStackPagesFrom(sp.Stack, int(sp.WriteTo))
-		stack := make([]uint64, 0, len(sp.Stack))
-		for _, fn := range sp.Stack {
-			info, ok := pmtinternal.SstMap[uint64(fn)]
-			if !ok {
-				panic(fmt.Sprintf("planStep1 snapshot: file %d not found in SstMap", fn))
-			}
-			stack = append(stack, info.Size/uint64(PageSize))
-		}
-		tmp = append(tmp, PartPlanStat{
-			PartLow:  sp.low,
-			PartHigh: sp.High,
-			NewPages: 0,
-			WriteTo:  sp.WriteTo,
-			Stack:    stack,
-			Reason:   reason,
-		})
 		pList = append(pList, sp)
 	}
 
@@ -139,7 +126,6 @@ func step1Simple() FlushPlan {
 		totalExtraWrite:    0,
 		totalReducedWrite:  0,
 		wt0:                collectWt0(pList),
-		stats:              tmp,
 		planList:           pList,
 	}
 }
@@ -147,7 +133,6 @@ func step1Simple() FlushPlan {
 func step1V1(newKeys []uint64) FlushPlan {
 	parts := pmtinternal.PartIdx
 	pList := make([]PartPlan, 0, len(parts))
-	tmp := make([]PartPlanStat, 0, len(parts))
 	var totalWriteExpected uint64
 
 	// Two pointers over sorted newKeys + sorted PartIdx range to get O(P+N).
@@ -164,9 +149,8 @@ func step1V1(newKeys []uint64) FlushPlan {
 		}
 		newKVCount := keyR - keyL
 		newPages := (newKVCount + KVPerPage - 1) / KVPerPage
-		sp, stat, writeExpected := buildStep1V1PartPlan(p, newPages)
+		sp, writeExpected := buildStep1V1PartPlan(p, newPages)
 		totalWriteExpected += writeExpected
-		tmp = append(tmp, stat)
 		pList = append(pList, sp)
 	}
 
@@ -178,7 +162,6 @@ func step1V1(newKeys []uint64) FlushPlan {
 		totalExtraWrite:    0,
 		totalReducedWrite:  0,
 		wt0:                collectWt0(pList),
-		stats:              tmp,
 		planList:           pList,
 	}
 }
@@ -187,7 +170,6 @@ func step1V2(newKeys []uint64) FlushPlan {
 	parts := pmtinternal.PartIdx
 	partCount := len(parts)
 	pList := make([]PartPlan, partCount)
-	tmp := make([]PartPlanStat, partCount)
 	chunkSize := pmtinternal.Step1V2ChunkSize
 	if chunkSize <= 0 {
 		panic(fmt.Sprintf("step1V2: invalid chunkSize %d", chunkSize))
@@ -231,9 +213,8 @@ func step1V2(newKeys []uint64) FlushPlan {
 				}
 				newKVCount := keyR - keyL
 				newPages := (newKVCount + KVPerPage - 1) / KVPerPage
-				sp, stat, writeExpected := buildStep1V1PartPlan(p, newPages)
+				sp, writeExpected := buildStep1V1PartPlan(p, newPages)
 				pList[i] = sp
-				tmp[i] = stat
 				localWriteExpected += writeExpected
 			}
 			workerWriteExpected[workerID] = localWriteExpected
@@ -254,7 +235,77 @@ func step1V2(newKeys []uint64) FlushPlan {
 		totalExtraWrite:    0,
 		totalReducedWrite:  0,
 		wt0:                collectWt0(pList),
-		stats:              tmp,
+		planList:           pList,
+	}
+}
+
+func step1V3(newKeys []uint64) FlushPlan {
+	parts := pmtinternal.PartIdx
+	pList := make([]PartPlan, 0, len(parts))
+	var totalWriteExpected uint64
+
+	keyL, keyR := 0, 0
+	for _, p := range parts {
+		for keyL < len(newKeys) && newKeys[keyL] < p.Low {
+			keyL++
+		}
+		if keyR < keyL {
+			keyR = keyL
+		}
+		for keyR < len(newKeys) && newKeys[keyR] <= p.High {
+			keyR++
+		}
+		newKVCount := keyR - keyL
+		newPages := (newKVCount + KVPerPage - 1) / KVPerPage
+		sp, writeExpected := buildStep1V3PartPlan(p, newPages)
+		totalWriteExpected += writeExpected
+		pList = append(pList, sp)
+	}
+
+	return FlushPlan{
+		passiveMergeCount:  0,
+		activeMergeCount:   0,
+		delayCompactCount:  0,
+		totalWriteExpected: totalWriteExpected,
+		totalExtraWrite:    0,
+		totalReducedWrite:  0,
+		wt0:                collectWt0(pList),
+		planList:           pList,
+	}
+}
+
+func step1V4(newKeys []uint64) FlushPlan {
+	parts := pmtinternal.PartIdx
+	pList := make([]PartPlan, 0, len(parts))
+	var totalWriteExpected uint64
+
+	keyL, keyR := 0, 0
+	for _, p := range parts {
+		for keyL < len(newKeys) && newKeys[keyL] < p.Low {
+			keyL++
+		}
+		if keyR < keyL {
+			keyR = keyL
+		}
+		for keyR < len(newKeys) && newKeys[keyR] <= p.High {
+			keyR++
+		}
+		newKVCount := keyR - keyL
+		newPages := (newKVCount + KVPerPage - 1) / KVPerPage
+
+		sp, writeExpected := buildStep1V4PartPlan(p, newPages)
+		totalWriteExpected += writeExpected
+		pList = append(pList, sp)
+	}
+
+	return FlushPlan{
+		passiveMergeCount:  0,
+		activeMergeCount:   0,
+		delayCompactCount:  0,
+		totalWriteExpected: totalWriteExpected,
+		totalExtraWrite:    0,
+		totalReducedWrite:  0,
+		wt0:                collectWt0(pList),
 		planList:           pList,
 	}
 }
@@ -269,7 +320,38 @@ func collectWt0(planList []PartPlan) []int {
 	return ret
 }
 
-func buildStep1V1PartPlan(p pmtinternal.Part, newPages int) (PartPlan, PartPlanStat, uint64) {
+func stackPagesFromFiles(stack []FileNum) []uint64 {
+	pages := make([]uint64, 0, len(stack))
+	for _, fn := range stack {
+		info, ok := pmtinternal.SstMap[uint64(fn)]
+		if !ok {
+			panic(fmt.Sprintf("plan snapshot: file %d not found in SstMap", fn))
+		}
+		pages = append(pages, sstSizeInPages(info.Size))
+	}
+	return pages
+}
+
+func partPlanStatFromPlan(pp PartPlan) PartPlanStat {
+	return PartPlanStat{
+		PartLow:  pp.low,
+		PartHigh: pp.High,
+		NewPages: pp.NewPages,
+		WriteTo:  pp.WriteTo,
+		Stack:    stackPagesFromFiles(pp.Stack),
+		Reason:   pp.Reason,
+	}
+}
+
+func snapshotPartPlanStats(planList []PartPlan) []PartPlanStat {
+	stats := make([]PartPlanStat, 0, len(planList))
+	for _, pp := range planList {
+		stats = append(stats, partPlanStatFromPlan(pp))
+	}
+	return stats
+}
+
+func buildStep1V1PartPlan(p pmtinternal.Part, newPages int) (PartPlan, uint64) {
 	const plan1A = 1.0
 	const plan1B = 2.0
 	const plan1WriteToBoundary = 4
@@ -307,26 +389,134 @@ func buildStep1V1PartPlan(p pmtinternal.Part, newPages int) (PartPlan, PartPlanS
 		reason = "reach_cap"
 	}
 	if writeTo >= manifest.NumLevels {
-		panic("writeTo >= manifest.NumLevels")
+		writeTo = manifest.NumLevels - 1
+		reason = reason + "_clamp_levels"
 	}
 	sp.WriteTo = uint16(writeTo)
+	sp.Reason = reason
 	writeExpected := uint64(newPages) + sumStackPagesFrom(sp.Stack, int(sp.WriteTo))
-	stack := make([]uint64, 0, len(sp.Stack))
-	for _, fn := range sp.Stack {
-		info, ok := pmtinternal.SstMap[uint64(fn)]
-		if !ok {
-			panic(fmt.Sprintf("planStep1 snapshot: file %d not found in SstMap", fn))
-		}
-		stack = append(stack, info.Size/uint64(PageSize))
-	}
-	return sp, PartPlanStat{
-		PartLow:  sp.low,
-		PartHigh: sp.High,
+	return sp, writeExpected
+}
+
+func buildStep1V3PartPlan(p pmtinternal.Part, newPages int) (PartPlan, uint64) {
+	const plan1WriteToBoundary = 4
+
+	sp := PartPlan{
+		High:     p.High,
+		low:      p.Low,
 		NewPages: newPages,
-		WriteTo:  sp.WriteTo,
-		Stack:    stack,
-		Reason:   reason,
-	}, writeExpected
+		WriteTo:  uint16(len(p.Stack)),
+		Stack:    p.Stack,
+		Outputs:  nil,
+	}
+	writeTo := len(sp.Stack)
+	rewritePages := 0
+	reason := "stack_empty"
+	if len(sp.Stack) > 0 {
+		reason = "no_threshold_limit_v3"
+	}
+	remainingSlots := plan1WriteToBoundary - len(sp.Stack)
+	if remainingSlots < 0 {
+		remainingSlots = 0
+	}
+	threshold := step1V3RewriteThreshold(newPages, remainingSlots)
+	for i := len(sp.Stack) - 1; i >= 0; i-- {
+		info, ok := pmtinternal.SstMap[uint64(sp.Stack[i])]
+		if !ok {
+			panic(fmt.Sprintf("planStep1V3: file %d not found in SstMap", sp.Stack[i]))
+		}
+		nextFilePages := int(info.Size / PageSize)
+		if float64(rewritePages+nextFilePages) > threshold {
+			reason = fmt.Sprintf("reach_threshold_v3_slots_%d", remainingSlots)
+			break
+		}
+		rewritePages += nextFilePages
+		writeTo = i
+	}
+	if writeTo == plan1WriteToBoundary {
+		writeTo--
+		reason = "reach_cap_v3"
+	}
+	if writeTo >= manifest.NumLevels {
+		writeTo = manifest.NumLevels - 1
+		reason = reason + "_clamp_levels"
+	}
+	sp.WriteTo = uint16(writeTo)
+	sp.Reason = reason
+	writeExpected := uint64(newPages) + sumStackPagesFrom(sp.Stack, int(sp.WriteTo))
+	return sp, writeExpected
+}
+
+func costV4(part pmtinternal.Part, newPages int, writeTo int) float64 {
+	tablePages := stackPagesFromFiles(part.Stack)
+	if writeTo < 0 || writeTo > len(tablePages) {
+		panic("costV4: invalid writeTo")
+	}
+	if writeTo == len(tablePages) {
+		return 0
+	}
+	var oldCost uint64
+	for j := writeTo + 1; j < len(tablePages); j++ {
+		oldCost += uint64(j-writeTo) * tablePages[j]
+	}
+	tablePagesI := float64(tablePages[writeTo])
+	slotsFromI := float64(len(tablePages) - writeTo)
+	return pmtinternal.Step1V4RewriteFactor*tablePagesI -
+		pmtinternal.Step1V4NewWeight*float64(newPages)*slotsFromI -
+		pmtinternal.Step1V4OldWeight*float64(oldCost)
+}
+
+func buildStep1V4PartPlan(p pmtinternal.Part, newPages int) (PartPlan, uint64) {
+	sp := PartPlan{
+		High:     p.High,
+		low:      p.Low,
+		NewPages: newPages,
+		WriteTo:  uint16(len(p.Stack)),
+		Stack:    p.Stack,
+		Outputs:  nil,
+	}
+	writeTo := len(sp.Stack)
+	reason := "stack_empty"
+	if len(sp.Stack) > 0 {
+		reason = "append_only_v4_min_cost_non_negative"
+	}
+	tablePages := stackPagesFromFiles(sp.Stack)
+	n := len(tablePages)
+	bestCost := 0.0
+	bestI := writeTo
+	for i := n - 1; i >= 0; i-- {
+		cost := costV4(p, newPages, i)
+		if cost < bestCost {
+			bestCost = cost
+			bestI = i
+		}
+	}
+	writeTo = bestI
+	if bestI < len(sp.Stack) {
+		reason = fmt.Sprintf("rewrite_v4_min_cost_i_%d", bestI)
+	}
+	if writeTo >= manifest.NumLevels {
+		writeTo = manifest.NumLevels - 1
+		reason = reason + "_clamp_levels"
+	}
+	sp.WriteTo = uint16(writeTo)
+	sp.Reason = reason
+	writeExpected := uint64(newPages) + sumStackPagesFrom(sp.Stack, int(sp.WriteTo))
+	return sp, writeExpected
+}
+
+func step1V3RewriteThreshold(newPages int, remainingSlots int) float64 {
+	if remainingSlots < 0 {
+		panic("step1V3RewriteThreshold: remainingSlots < 0")
+	}
+	switch {
+	case remainingSlots >= 2:
+		return 0.35*float64(newPages) + 1
+	case remainingSlots == 1:
+		return 0.7*float64(newPages) + 2
+	default:
+		return 1.0*float64(newPages) + 2
+	}
 }
 
 func sumStackPagesFrom(stack []FileNum, from int) uint64 {
@@ -354,8 +544,6 @@ func sstSizeInPages(size uint64) uint64 {
 func recordFlushPlan(flushPlan FlushPlan) {
 	totalWriteExpectedList = append(totalWriteExpectedList, flushPlan.totalWriteExpected)
 	wt0 := append([]int(nil), flushPlan.wt0...)
-	stats := make([]PartPlanStat, len(flushPlan.stats))
-	copy(stats, flushPlan.stats)
 	flushHistory = append(flushHistory, FlushPlanStat{
 		passiveMergeCount:  flushPlan.passiveMergeCount,
 		activeMergeCount:   flushPlan.activeMergeCount,
@@ -364,27 +552,17 @@ func recordFlushPlan(flushPlan FlushPlan) {
 		totalExtraWrite:    flushPlan.totalExtraWrite,
 		totalReducedWrite:  flushPlan.totalReducedWrite,
 		wt0:                wt0,
-		plans:              stats,
+		plans:              snapshotPartPlanStats(flushPlan.planList),
 	})
-}
-
-func mergePlanStat(cur PartPlanStat, next PartPlanStat) PartPlanStat {
-	cur.PartHigh = next.PartHigh
-	cur.NewPages += next.NewPages
-	cur.Stack = append(cur.Stack, next.Stack...)
-	return cur
 }
 
 func mergeAdjacent_wt0(flushPlan FlushPlan) FlushPlan {
 	merged := make([]PartPlan, 0, len(flushPlan.planList))
-	mergedStats := make([]PartPlanStat, 0, len(flushPlan.stats))
 	passiveMergeCount := 0
 	for i := 0; i < len(flushPlan.planList); { // 双指针
 		cur := flushPlan.planList[i]
-		curStat := flushPlan.stats[i]
 		if cur.WriteTo != 0 {
 			merged = append(merged, cur)
-			mergedStats = append(mergedStats, curStat)
 			i++
 			continue
 		}
@@ -395,17 +573,14 @@ func mergeAdjacent_wt0(flushPlan FlushPlan) FlushPlan {
 			cur.High = next.High
 			cur.NewPages += next.NewPages
 			cur.Stack = append(cur.Stack, next.Stack...)
-			curStat = mergePlanStat(curStat, flushPlan.stats[j])
 			passiveMergeCount++
 		}
 		merged = append(merged, cur)
-		mergedStats = append(mergedStats, curStat)
 		i = j
 	}
 	flushPlan.passiveMergeCount += passiveMergeCount
 	flushPlan.planList = merged
 	flushPlan.wt0 = collectWt0(merged)
-	flushPlan.stats = mergedStats
 	return flushPlan
 }
 
@@ -420,9 +595,6 @@ func adjustedReasonForWriteToChange(from, to int) string {
 }
 
 func delaySmallCompaction(flushPlan FlushPlan) FlushPlan {
-	if len(flushPlan.stats) != len(flushPlan.planList) {
-		panic("len(flushPlan.stats) != len(flushPlan.planList)")
-	}
 	for _, idx := range flushPlan.wt0 {
 		if idx < 0 || idx >= len(flushPlan.planList) {
 			panic("delaySmallCompaction: invalid wt0 idx")
@@ -447,8 +619,7 @@ func delaySmallCompaction(flushPlan FlushPlan) FlushPlan {
 		oldWriteTo := int(pp.WriteTo)
 		newWriteTo := len(pp.Stack)
 		pp.WriteTo = uint16(newWriteTo)
-		flushPlan.stats[idx].WriteTo = pp.WriteTo
-		flushPlan.stats[idx].Reason = adjustedReasonForWriteToChange(oldWriteTo, newWriteTo)
+		pp.Reason = adjustedReasonForWriteToChange(oldWriteTo, newWriteTo)
 		flushPlan.totalWriteExpected -= reducedWrite
 		flushPlan.totalReducedWrite += reducedWrite
 		flushPlan.delayCompactCount++
@@ -504,9 +675,6 @@ func activeMergePlan(flushPlan FlushPlan, extraWriteThreshold uint64) FlushPlan 
 	if flushPlan.wt0 == nil {
 		panic("flushPlan.wt0 == nil")
 	}
-	if len(flushPlan.stats) != len(flushPlan.planList) {
-		panic("len(flushPlan.stats) != len(flushPlan.planList)")
-	}
 	if len(flushPlan.planList) <= 1 {
 		return flushPlan
 	}
@@ -556,8 +724,7 @@ func activeMergePlan(flushPlan FlushPlan, extraWriteThreshold uint64) FlushPlan 
 		oldWriteTo := int(flushPlan.planList[tryPush.ppIdx].WriteTo)
 		flushPlan.wt0 = append(flushPlan.wt0, tryPush.ppIdx)
 		flushPlan.planList[tryPush.ppIdx].WriteTo = 0
-		flushPlan.stats[tryPush.ppIdx].WriteTo = 0
-		flushPlan.stats[tryPush.ppIdx].Reason = adjustedReasonForWriteToChange(oldWriteTo, 0)
+		flushPlan.planList[tryPush.ppIdx].Reason = adjustedReasonForWriteToChange(oldWriteTo, 0)
 		flushPlan.totalWriteExpected += tryPush.extraWrite
 		totalExtraWrite += tryPush.extraWrite
 		flushPlan.totalExtraWrite += tryPush.extraWrite
@@ -662,6 +829,7 @@ type PartPlan struct {
 	low      uint64 // what use?
 	NewPages int
 	WriteTo  uint16 // 0 means rewrite all, stack.len means just flush no rewrite
+	Reason   string
 	Stack    []FileNum
 	Outputs  []uint64
 }

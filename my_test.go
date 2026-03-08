@@ -440,7 +440,7 @@ func Test_pmt_wa(t *testing.T) {
 	db := MustDB(path, false, func(options *Options) *Options {
 		//options.FS = vfs.Default
 
-		pmtinternal.SetStep1Method(pmtinternal.PlanStep1V2)
+		pmtinternal.SetStep1Method(pmtinternal.PlanStep1V4)
 		pmtinternal.EnablePMTTableFormat = true
 		options.FileFormat = sstable.TableFormatPMT0
 		//options.FileFormat = sstable.TableFormatPebblev6

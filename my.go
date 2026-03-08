@@ -1006,21 +1006,17 @@ func _newPickedFilesCompaction(
 
 	// assert
 	minLevel := numLevels
-	maxLevel := -1
 	for level := range filesMap {
 		if level < minLevel {
 			minLevel = level
 		}
-		if level > maxLevel {
-			maxLevel = level
-		}
-	}
-	if outputLevel < maxLevel {
-		panic(fmt.Sprintf("warning: outputLevel %d is less than maxLevel %d of input files", outputLevel, maxLevel))
 	}
 
 	startLevel := minLevel
 	adjusted := adjustedOutputLevel(outputLevel, baseLevel)
+	if outputLevel > 0 && adjusted < 1 {
+		adjusted = 1
+	}
 	pc := &pickedCompaction{
 		cmp:                    opts.Comparer.Compare,
 		version:                vers,
@@ -1036,7 +1032,11 @@ func _newPickedFilesCompaction(
 	// inputs[n] = outputLevel
 	var inputs []compactionLevel
 
-	// startLevel
+	actualLevels := make([]int, 0, len(filesMap))
+	for level := range filesMap {
+		actualLevels = append(actualLevels, level)
+	}
+	sort.Ints(actualLevels)
 	filesStartLevel, ok := filesMap[startLevel]
 	if !ok {
 		panic(fmt.Sprintf("why? startLevel %d not found in filesMap", startLevel))
@@ -1045,23 +1045,22 @@ func _newPickedFilesCompaction(
 		level: startLevel,
 		files: manifest.NewLevelSliceKeySorted(opts.Comparer.Compare, filesStartLevel),
 	})
-	// extraLevels
-	for level := startLevel + 1; level < outputLevel; level++ {
-		if files, ok := filesMap[level]; ok {
-			inputs = append(inputs, compactionLevel{
-				level: level,
-				files: manifest.NewLevelSliceKeySorted(opts.Comparer.Compare, files),
-			})
+	for _, level := range actualLevels[1:] {
+		if level == outputLevel {
+			continue
 		}
+		inputs = append(inputs, compactionLevel{
+			level: level,
+			files: manifest.NewLevelSliceKeySorted(opts.Comparer.Compare, filesMap[level]),
+		})
 	}
 
 	var outputLevelFiles []*manifest.TableMetadata
 	if files, ok := filesMap[outputLevel]; ok {
 		outputLevelFiles = files
 	}
-	// If this is an intra-level compaction (startLevel == outputLevel),
-	// do not duplicate files in the outputLevel inputs to avoid marking
-	// the same file as compacting twice.
+	// If the target output level is already represented by an input level,
+	// avoid duplicating the same files in the trailing output-level slot.
 	if outputLevel == startLevel {
 		outputLevelFiles = nil
 	}

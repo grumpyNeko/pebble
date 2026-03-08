@@ -88,33 +88,14 @@ func Test_activeMergePlan(t *testing.T) {
 			High:    high,
 			low:     low,
 			WriteTo: writeTo,
+			Reason:  "test",
 			Stack:   stack,
 		}
 	}
 	newFlushPlan := func(step1Total uint64, planList []PartPlan) FlushPlan {
-		stats := make([]PartPlanStat, 0, len(planList))
-		for _, pp := range planList {
-			stack := make([]uint64, 0, len(pp.Stack))
-			for _, fn := range pp.Stack {
-				info, ok := pmtinternal.SstMap[uint64(fn)]
-				if !ok {
-					panic(fmt.Sprintf("newFlushPlan: file %d not found in SstMap", fn))
-				}
-				stack = append(stack, info.Size/uint64(PageSize))
-			}
-			stats = append(stats, PartPlanStat{
-				PartLow:  pp.low,
-				PartHigh: pp.High,
-				NewPages: 0,
-				WriteTo:  pp.WriteTo,
-				Stack:    stack,
-				Reason:   "test",
-			})
-		}
 		return FlushPlan{
 			totalWriteExpected: step1Total,
 			wt0:                collectWt0(planList),
-			stats:              stats,
 			planList:           planList,
 		}
 	}
