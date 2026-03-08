@@ -203,14 +203,14 @@ stack变成[L6,L5,L5], writeTo=2, 写入L4, 但输入中有L5文件
 此时slot与Level不是一一对应
 
 怎么办 
-- outputLevel=max(outputLevelForWriteTo(writeTo),maxInputLevel), 这是不对的
-- stack的元素改为[]FileNum
-- []FileNum + []SlotID的改动更小
+- outputLevel=max(outputLevelForWriteTo(writeTo),maxInputLevel), 这不对, pebble的Level只有7层, 改manifest.NumLevels容易出问题
+- stack slot改为[]FileNum, 会对其他代码有影响!
+- 都放在L0
+- 修改输出文件的level, 让slot和level对应
 
-把stack的元素改为[]FileNum也不行, pebble的Level只有7层, 改manifest.NumLevels容易出问题
-如果stack的元素改为[]FileNum, 会对其他代码有影响
-如果pmt把所有文件都放在L0会怎样
-  L0有sublevel数量可以设置
+
+都放在L0
+  设置L0 sublevel数量
   由于pmt的multilevelflush的输出总是最新的, 直接放L0(最上面), 不会导致老数据掩盖新数据(即使没有seqnum)
 反对? 删旧L0文件+加新L0文件，重建sublevels
 
