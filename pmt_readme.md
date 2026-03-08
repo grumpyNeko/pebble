@@ -196,7 +196,10 @@ activeMergePlan, totalExtraWrite, ..很多名字不太好, 统计方式也次优
 wt0改成map, 不要多次collectWt0而是随时维护wt0
 
 # stack slot 与 pebble level
-outputLevelForWriteTo希望writeTo=0对应L6, writeTo=1对应L5, ...
+outputLevelForWriteTo希望保持stack slot与pebble level一一对应 
+- writeTo=0 -> L6                                                                                                                                                                                                                            
+- writeTo=1 -> L5                                                                                                                                                                                                                            
+- writeTo=2 -> L4 
 但有例外
 stack=[L6,L5,L4], writeTo=1, 写入L5, 产生两个文件                               
 stack变成[L6,L5,L5], writeTo=2, 写入L4, 但输入中有L5文件
@@ -208,13 +211,12 @@ stack变成[L6,L5,L5], writeTo=2, 写入L4, 但输入中有L5文件
 - 都放在L0
 - 修改输出文件的level, 让slot和level对应
 
-
 都放在L0
   设置L0 sublevel数量
   由于pmt的multilevelflush的输出总是最新的, 直接放L0(最上面), 不会导致老数据掩盖新数据(即使没有seqnum)
 反对? 删旧L0文件+加新L0文件，重建sublevels
 
-DO: 删outputLevelForWriteTo, stack writeTo不再映射Pebble level, multiflush只写L0
+尝试: 删outputLevelForWriteTo, stack writeTo不再映射Pebble level, multiflush只写L0
 L0按seqnum排序
 panic: L0 files 000140 and 000062 are not properly ordered: <#0-#91> vs <#0-#37>
 可能与L0的特殊顺序有关
@@ -228,3 +230,8 @@ func newCompactionInputLevelSlice(
 	return manifest.NewLevelSliceKeySorted(cmp, files)
 }
 ```
+
+目前, 放宽_newPickedFilesCompaction里的检查, 能跑但不知道为什么
+- 去掉“outputLevel 不能浅于输入最大层”的限制 
+- inputs按实际输入层收集，不按startLevel..outputLevel连续区间收集
+- 给adjustedOutputLevel加了下限，避免opts.Level(-1)
