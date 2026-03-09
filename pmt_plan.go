@@ -8,10 +8,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
-	"sync"
 )
 
 const (
@@ -25,7 +23,8 @@ type PartPlanStat struct {
 	NewPages int
 	WriteTo  uint16
 	Stack    []uint64 // file size in page
-	Reason   string
+	//Collect  bool     // 写入collector
+	Reason string
 }
 
 type FlushPlanStat struct {
@@ -53,17 +52,10 @@ type FlushPlan struct {
 	planList           []PartPlan
 }
 
-// todo: 改成并发的
 func planStep1(newKeys []uint64) FlushPlan {
 	switch pmtinternal.Step1Method {
 	case pmtinternal.PlanStep1Simple:
 		return step1Simple()
-	case pmtinternal.PlanStep1V1:
-		return step1V1(newKeys)
-	case pmtinternal.PlanStep1V2:
-		return step1V2(newKeys)
-	case pmtinternal.PlanStep1V3:
-		return step1V3(newKeys)
 	case pmtinternal.PlanStep1V4:
 		return step1V4(newKeys)
 	default:
@@ -73,12 +65,15 @@ func planStep1(newKeys []uint64) FlushPlan {
 
 func plan(newKeys []uint64) FlushPlan {
 	flushPlan := planStep1(newKeys)
-	flushPlan = mergeAdjacent_wt0(flushPlan)
+	newPlanList, mergeCount := mergeAdjacent_wt0(flushPlan.planList)
+	flushPlan.planList = newPlanList
+	flushPlan.passiveMergeCount = mergeCount
+	flushPlan.wt0 = collectWt0(newPlanList)
 	if len(flushHistory) > pmtinternal.NoActiveMergeUntil {
 		if flushPlan.totalWriteExpected < pmtinternal.WriteThresholdInPages0 {
 			extraWriteThreshold := pmtinternal.WriteThresholdInPages0 - flushPlan.totalWriteExpected
 			flushPlan = activeMergePlan(flushPlan, extraWriteThreshold)
-			flushPlan = mergeAdjacent_wt0(flushPlan)
+			newPlanList, mergeCount = mergeAdjacent_wt0(flushPlan.planList)
 		}
 		// todo: 推迟也不能只追加啊
 		//if flushPlan.totalWriteExpected > pmtinternal.WriteThresholdInPages1 {
@@ -95,27 +90,26 @@ func step1Simple() FlushPlan {
 	pList := make([]PartPlan, 0, 256)
 	var totalWriteExpected uint64
 	for _, p := range pmtinternal.PartIdx {
-		sp := PartPlan{
-			High:     p.High,
-			low:      p.Low,
-			NewPages: 0,
-			WriteTo:  uint16(len(p.Stack)),
-			Stack:    p.Stack,
-			Outputs:  nil,
+		plan := PartPlan{
+			High:    p.High,
+			low:     p.Low,
+			WriteTo: uint16(len(p.Stack)),
+			Stack:   p.Stack,
+			Outputs: nil,
 		}
-		writeTo := len(sp.Stack)
+		writeTo := len(plan.Stack)
 		reason := "append_only"
-		if len(sp.Stack) > threshold {
+		if len(plan.Stack) > threshold {
 			writeTo = 0
 			reason = "stack_len_reach_threshold"
 		}
 		if writeTo >= manifest.NumLevels {
 			panic(fmt.Sprintf("writeTo >= manifest.NumLevels"))
 		}
-		sp.WriteTo = uint16(writeTo)
-		sp.Reason = reason
-		totalWriteExpected += sumStackPagesFrom(sp.Stack, int(sp.WriteTo))
-		pList = append(pList, sp)
+		plan.WriteTo = uint16(writeTo)
+		plan.Reason = reason
+		totalWriteExpected += sumStackPagesFrom(plan.Stack, int(plan.WriteTo))
+		pList = append(pList, plan)
 	}
 
 	return FlushPlan{
@@ -130,172 +124,55 @@ func step1Simple() FlushPlan {
 	}
 }
 
-func step1V1(newKeys []uint64) FlushPlan {
-	parts := pmtinternal.PartIdx
-	pList := make([]PartPlan, 0, len(parts))
-	var totalWriteExpected uint64
-
-	// Two pointers over sorted newKeys + sorted PartIdx range to get O(P+N).
-	keyL, keyR := 0, 0
-	for _, p := range parts {
-		for keyL < len(newKeys) && newKeys[keyL] < p.Low {
-			keyL++
-		}
-		if keyR < keyL {
-			keyR = keyL
-		}
-		for keyR < len(newKeys) && newKeys[keyR] <= p.High {
-			keyR++
-		}
-		newKVCount := keyR - keyL
-		newPages := (newKVCount + KVPerPage - 1) / KVPerPage
-		sp, writeExpected := buildStep1V1PartPlan(p, newPages)
-		totalWriteExpected += writeExpected
-		pList = append(pList, sp)
-	}
-
-	return FlushPlan{
-		passiveMergeCount:  0,
-		activeMergeCount:   0,
-		delayCompactCount:  0,
-		totalWriteExpected: totalWriteExpected,
-		totalExtraWrite:    0,
-		totalReducedWrite:  0,
-		wt0:                collectWt0(pList),
-		planList:           pList,
-	}
+// mem.keys[idxL, idxR]包含low和high
+func seekFakeMemTable(mem fakeMemTable, low uint64, high uint64) (idxL int, idxR int) {
+	idxL = sort.Search(len(mem.keys), func(i int) bool {
+		return mem.keys[i] >= low
+	})
+	idxR = sort.Search(len(mem.keys), func(i int) bool {
+		return mem.keys[i] > high
+	})
+	return idxL, idxR
 }
 
-func step1V2(newKeys []uint64) FlushPlan {
-	parts := pmtinternal.PartIdx
-	partCount := len(parts)
-	pList := make([]PartPlan, partCount)
-	chunkSize := pmtinternal.Step1V2ChunkSize
-	if chunkSize <= 0 {
-		panic(fmt.Sprintf("step1V2: invalid chunkSize %d", chunkSize))
-	}
-	workers := partCount / chunkSize
-	maxWorkers := runtime.GOMAXPROCS(0)
-	if workers > maxWorkers {
-		workers = maxWorkers
-	}
-	if workers < 1 {
-		workers = 1
-	}
-
-	var wg sync.WaitGroup
-	workerWriteExpected := make([]uint64, workers)
-	for wid := 0; wid < workers; wid++ {
-		start := wid * partCount / workers
-		end := (wid + 1) * partCount / workers
-		wg.Add(1)
-		go func(workerID, start, end int) {
-			defer wg.Done()
-			if start >= end {
-				return
-			}
-			// Find first key index that may hit this worker segment.
-			keyL := sort.Search(len(newKeys), func(i int) bool {
-				return newKeys[i] >= parts[start].Low
-			})
-			keyR := keyL
-			var localWriteExpected uint64
-			for i := start; i < end; i++ {
-				p := parts[i]
-				for keyL < len(newKeys) && newKeys[keyL] < p.Low {
-					keyL++
-				}
-				if keyR < keyL {
-					keyR = keyL
-				}
-				for keyR < len(newKeys) && newKeys[keyR] <= p.High {
-					keyR++
-				}
-				newKVCount := keyR - keyL
-				newPages := (newKVCount + KVPerPage - 1) / KVPerPage
-				sp, writeExpected := buildStep1V1PartPlan(p, newPages)
-				pList[i] = sp
-				localWriteExpected += writeExpected
-			}
-			workerWriteExpected[workerID] = localWriteExpected
-		}(wid, start, end)
-	}
-	wg.Wait()
-
-	var totalWriteExpected uint64
-	for _, v := range workerWriteExpected {
-		totalWriteExpected += v
-	}
-
-	return FlushPlan{
-		passiveMergeCount:  0,
-		activeMergeCount:   0,
-		delayCompactCount:  0,
-		totalWriteExpected: totalWriteExpected,
-		totalExtraWrite:    0,
-		totalReducedWrite:  0,
-		wt0:                collectWt0(pList),
-		planList:           pList,
-	}
+// mem.keys[idxL, idxR]包含low和high
+func seekKeys(keys []uint64, low uint64, high uint64) (idxL int, idxR int) {
+	idxL = sort.Search(len(keys), func(i int) bool {
+		return keys[i] >= low
+	})
+	idxR = sort.Search(len(keys), func(i int) bool {
+		return keys[i] > high
+	})
+	return idxL, idxR
 }
 
-func step1V3(newKeys []uint64) FlushPlan {
-	parts := pmtinternal.PartIdx
-	pList := make([]PartPlan, 0, len(parts))
-	var totalWriteExpected uint64
-
-	keyL, keyR := 0, 0
-	for _, p := range parts {
-		for keyL < len(newKeys) && newKeys[keyL] < p.Low {
-			keyL++
-		}
-		if keyR < keyL {
-			keyR = keyL
-		}
-		for keyR < len(newKeys) && newKeys[keyR] <= p.High {
-			keyR++
-		}
-		newKVCount := keyR - keyL
-		newPages := (newKVCount + KVPerPage - 1) / KVPerPage
-		sp, writeExpected := buildStep1V3PartPlan(p, newPages)
-		totalWriteExpected += writeExpected
-		pList = append(pList, sp)
-	}
-
-	return FlushPlan{
-		passiveMergeCount:  0,
-		activeMergeCount:   0,
-		delayCompactCount:  0,
-		totalWriteExpected: totalWriteExpected,
-		totalExtraWrite:    0,
-		totalReducedWrite:  0,
-		wt0:                collectWt0(pList),
-		planList:           pList,
-	}
+func kvCountToPageCount(kvCount int) int {
+	return (kvCount + KVPerPage - 1) / KVPerPage
 }
 
 func step1V4(newKeys []uint64) FlushPlan {
-	parts := pmtinternal.PartIdx
-	pList := make([]PartPlan, 0, len(parts))
+	pList := make([]PartPlan, 0, len(pmtinternal.PartIdx))
 	var totalWriteExpected uint64
 
-	keyL, keyR := 0, 0
-	for _, p := range parts {
-		for keyL < len(newKeys) && newKeys[keyL] < p.Low {
-			keyL++
+	for _, part := range pmtinternal.PartIdx {
+		idxL, idxR := seekKeys(newKeys, part.Low, part.High)
+		newKVCount := idxR - idxL
+		if collectorEnabled() {
+			newKVCount += collectorKVCountInRange(part.Low, part.High)
 		}
-		if keyR < keyL {
-			keyR = keyL
-		}
-		for keyR < len(newKeys) && newKeys[keyR] <= p.High {
-			keyR++
-		}
-		newKVCount := keyR - keyL
-		newPages := (newKVCount + KVPerPage - 1) / KVPerPage
-
-		sp, writeExpected := buildStep1V4PartPlan(p, newPages)
+		newPages := kvCountToPageCount(newKVCount)
+		writeTo, reason, writeExpected := doStep1V4PartPlan(part, newPages)
 		totalWriteExpected += writeExpected
-		pList = append(pList, sp)
+		pList = append(pList, PartPlan{
+			High: part.High,
+			low:  part.Low,
+			//MemTableIdxL:    idxL,
+			//MemTableKVCount: idxR - idxL,
+			NewPageCount: newPages,
+			WriteTo:      writeTo,
+			Reason:       reason,
+			Stack:        part.Stack,
+		})
 	}
 
 	return FlushPlan{
@@ -336,7 +213,7 @@ func partPlanStatFromPlan(pp PartPlan) PartPlanStat {
 	return PartPlanStat{
 		PartLow:  pp.low,
 		PartHigh: pp.High,
-		NewPages: pp.NewPages,
+		NewPages: pp.NewPageCount,
 		WriteTo:  pp.WriteTo,
 		Stack:    stackPagesFromFiles(pp.Stack),
 		Reason:   pp.Reason,
@@ -351,104 +228,12 @@ func snapshotPartPlanStats(planList []PartPlan) []PartPlanStat {
 	return stats
 }
 
-func buildStep1V1PartPlan(p pmtinternal.Part, newPages int) (PartPlan, uint64) {
-	const plan1A = 1.0
-	const plan1B = 2.0
-	const plan1WriteToBoundary = 4
-
-	sp := PartPlan{
-		High:     p.High,
-		low:      p.Low,
-		NewPages: newPages,
-		WriteTo:  uint16(len(p.Stack)),
-		Stack:    p.Stack,
-		Outputs:  nil,
-	}
-	threshold := plan1A*float64(newPages) + plan1B
-	writeTo := len(sp.Stack)
-	rewritePages := 0
-	reason := "stack_empty"
-	if len(sp.Stack) > 0 {
-		reason = "no_threshold_limit"
-	}
-	for i := len(sp.Stack) - 1; i >= 0; i-- {
-		info, ok := pmtinternal.SstMap[uint64(sp.Stack[i])]
-		if !ok {
-			panic(fmt.Sprintf("planStep1: file %d not found in SstMap", sp.Stack[i]))
-		}
-		nextFilePages := int(info.Size / PageSize)
-		if float64(rewritePages+nextFilePages) > threshold {
-			reason = "reach_threshold"
-			break
-		}
-		rewritePages += nextFilePages
-		writeTo = i
-	}
-	if writeTo == plan1WriteToBoundary {
-		writeTo--
-		reason = "reach_cap"
-	}
-	if writeTo >= manifest.NumLevels {
-		writeTo = manifest.NumLevels - 1
-		reason = reason + "_clamp_levels"
-	}
-	sp.WriteTo = uint16(writeTo)
-	sp.Reason = reason
-	writeExpected := uint64(newPages) + sumStackPagesFrom(sp.Stack, int(sp.WriteTo))
-	return sp, writeExpected
-}
-
-func buildStep1V3PartPlan(p pmtinternal.Part, newPages int) (PartPlan, uint64) {
-	const plan1WriteToBoundary = 4
-
-	sp := PartPlan{
-		High:     p.High,
-		low:      p.Low,
-		NewPages: newPages,
-		WriteTo:  uint16(len(p.Stack)),
-		Stack:    p.Stack,
-		Outputs:  nil,
-	}
-	writeTo := len(sp.Stack)
-	rewritePages := 0
-	reason := "stack_empty"
-	if len(sp.Stack) > 0 {
-		reason = "no_threshold_limit_v3"
-	}
-	remainingSlots := plan1WriteToBoundary - len(sp.Stack)
-	if remainingSlots < 0 {
-		remainingSlots = 0
-	}
-	threshold := step1V3RewriteThreshold(newPages, remainingSlots)
-	for i := len(sp.Stack) - 1; i >= 0; i-- {
-		info, ok := pmtinternal.SstMap[uint64(sp.Stack[i])]
-		if !ok {
-			panic(fmt.Sprintf("planStep1V3: file %d not found in SstMap", sp.Stack[i]))
-		}
-		nextFilePages := int(info.Size / PageSize)
-		if float64(rewritePages+nextFilePages) > threshold {
-			reason = fmt.Sprintf("reach_threshold_v3_slots_%d", remainingSlots)
-			break
-		}
-		rewritePages += nextFilePages
-		writeTo = i
-	}
-	if writeTo == plan1WriteToBoundary {
-		writeTo--
-		reason = "reach_cap_v3"
-	}
-	if writeTo >= manifest.NumLevels {
-		writeTo = manifest.NumLevels - 1
-		reason = reason + "_clamp_levels"
-	}
-	sp.WriteTo = uint16(writeTo)
-	sp.Reason = reason
-	writeExpected := uint64(newPages) + sumStackPagesFrom(sp.Stack, int(sp.WriteTo))
-	return sp, writeExpected
-}
-
-func costV4(part pmtinternal.Part, newPages int, writeTo int) float64 {
-	tablePages := stackPagesFromFiles(part.Stack)
+func costV4(stack []base.FileNum, newPages int, writeTo int) float64 {
+	const (
+		C = 5
+		B = 50
+	)
+	tablePages := stackPagesFromFiles(stack)
 	if writeTo < 0 || writeTo > len(tablePages) {
 		panic("costV4: invalid writeTo")
 	}
@@ -461,62 +246,43 @@ func costV4(part pmtinternal.Part, newPages int, writeTo int) float64 {
 	}
 	tablePagesI := float64(tablePages[writeTo])
 	slotsFromI := float64(len(tablePages) - writeTo)
-	return pmtinternal.Step1V4RewriteFactor*tablePagesI -
+
+	ret := pmtinternal.Step1V4RewriteFactor*tablePagesI -
 		pmtinternal.Step1V4NewWeight*float64(newPages)*slotsFromI -
 		pmtinternal.Step1V4OldWeight*float64(oldCost)
+	if len(stack) >= C && writeTo < C {
+		ret -= B
+	}
+	return ret
 }
 
-func buildStep1V4PartPlan(p pmtinternal.Part, newPages int) (PartPlan, uint64) {
-	sp := PartPlan{
-		High:     p.High,
-		low:      p.Low,
-		NewPages: newPages,
-		WriteTo:  uint16(len(p.Stack)),
-		Stack:    p.Stack,
-		Outputs:  nil,
-	}
-	writeTo := len(sp.Stack)
+func doStep1V4PartPlan(p pmtinternal.Part, newPages int) (uint16, string, uint64) {
+	writeTo := len(p.Stack)
 	reason := "stack_empty"
-	if len(sp.Stack) > 0 {
+	if len(p.Stack) > 0 {
 		reason = "append_only_v4_min_cost_non_negative"
 	}
-	tablePages := stackPagesFromFiles(sp.Stack)
+	tablePages := stackPagesFromFiles(p.Stack)
 	n := len(tablePages)
 	bestCost := 0.0
-	bestI := writeTo
+	bestWt := writeTo
 	for i := n - 1; i >= 0; i-- {
-		cost := costV4(p, newPages, i)
+		cost := costV4(p.Stack, newPages, i)
 		if cost < bestCost {
 			bestCost = cost
-			bestI = i
+			bestWt = i
 		}
 	}
-	writeTo = bestI
-	if bestI < len(sp.Stack) {
-		reason = fmt.Sprintf("rewrite_v4_min_cost_i_%d", bestI)
+	writeTo = bestWt
+	if bestWt < len(p.Stack) {
+		reason = fmt.Sprintf("rewrite_v4_min_cost_i_%d", bestWt)
 	}
 	if writeTo >= manifest.NumLevels {
 		writeTo = manifest.NumLevels - 1
 		reason = reason + "_clamp_levels"
 	}
-	sp.WriteTo = uint16(writeTo)
-	sp.Reason = reason
-	writeExpected := uint64(newPages) + sumStackPagesFrom(sp.Stack, int(sp.WriteTo))
-	return sp, writeExpected
-}
-
-func step1V3RewriteThreshold(newPages int, remainingSlots int) float64 {
-	if remainingSlots < 0 {
-		panic("step1V3RewriteThreshold: remainingSlots < 0")
-	}
-	switch {
-	case remainingSlots >= 2:
-		return 0.35*float64(newPages) + 1
-	case remainingSlots == 1:
-		return 0.7*float64(newPages) + 2
-	default:
-		return 1.0*float64(newPages) + 2
-	}
+	writeExpected := uint64(newPages) + sumStackPagesFrom(p.Stack, writeTo)
+	return uint16(writeTo), reason, writeExpected
 }
 
 func sumStackPagesFrom(stack []FileNum, from int) uint64 {
@@ -556,32 +322,26 @@ func recordFlushPlan(flushPlan FlushPlan) {
 	})
 }
 
-func mergeAdjacent_wt0(flushPlan FlushPlan) FlushPlan {
-	merged := make([]PartPlan, 0, len(flushPlan.planList))
-	passiveMergeCount := 0
-	for i := 0; i < len(flushPlan.planList); { // 双指针
-		cur := flushPlan.planList[i]
-		if cur.WriteTo != 0 {
-			merged = append(merged, cur)
-			i++
+func mergeAdjacent_wt0(planList []PartPlan) ([]PartPlan, int) {
+	newPlanList := make([]PartPlan, 0, len(planList))
+	mergeCount := 0
+	for _, p := range planList {
+		if p.WriteTo != 0 {
+			newPlanList = append(newPlanList, p)
 			continue
 		}
-		j := i + 1
-		for ; j < len(flushPlan.planList) && flushPlan.planList[j].WriteTo == 0; j++ {
-			next := flushPlan.planList[j]
-			// no need to check keyrange
-			cur.High = next.High
-			cur.NewPages += next.NewPages
-			cur.Stack = append(cur.Stack, next.Stack...)
-			passiveMergeCount++
+		if len(newPlanList) == 0 || newPlanList[len(newPlanList)-1].WriteTo != 0 {
+			newPlanList = append(newPlanList, p)
+			continue
 		}
-		merged = append(merged, cur)
-		i = j
+		last := &newPlanList[len(newPlanList)-1]
+		// no need to check keyrange
+		last.High = p.High
+		last.NewPageCount += p.NewPageCount // todo: 改成MemTableIdxL了, 先别管
+		last.Stack = append(last.Stack, p.Stack...)
+		mergeCount++
 	}
-	flushPlan.passiveMergeCount += passiveMergeCount
-	flushPlan.planList = merged
-	flushPlan.wt0 = collectWt0(merged)
-	return flushPlan
+	return newPlanList, mergeCount
 }
 
 func adjustedReasonForWriteToChange(from, to int) string {
@@ -603,7 +363,7 @@ func delaySmallCompaction(flushPlan FlushPlan) FlushPlan {
 		if pp.WriteTo != 0 {
 			panic("delaySmallCompaction: pp.WriteTo != 0")
 		}
-		if pp.NewPages >= pmtinternal.DelayCompactNewPagesThreshold {
+		if pp.NewPageCount >= pmtinternal.DelayCompactNewPagesThreshold {
 			continue
 		}
 		if len(pp.Stack) >= manifest.NumLevels {
@@ -628,7 +388,7 @@ func delaySmallCompaction(flushPlan FlushPlan) FlushPlan {
 	return flushPlan
 }
 
-// todo: 不一定要把pp.WriteTo提前到0
+// todo: 以后不一定要把pp.WriteTo提前到0, 提前到1就行了
 func extraWriteExpected(pp PartPlan) uint64 {
 	if int(pp.WriteTo) > len(pp.Stack) {
 		panic("pp.WriteTo > len(pp.Stack)")
@@ -636,32 +396,23 @@ func extraWriteExpected(pp PartPlan) uint64 {
 	if pp.WriteTo == 0 {
 		panic("pp.WriteTo == 0")
 	}
+	// TODO: 应该涉及cost, ..
+	//oldCost := costV4(pp.Stack, pp.NewPageCount, int(pp.WriteTo))
+	//newCost := costV4(pp.Stack, pp.NewPageCount, 0)
 	return sumStackPagesFrom(pp.Stack, 0) - sumStackPagesFrom(pp.Stack, int(pp.WriteTo))
 }
 
-func chooseTryPushIdx(flushPlan FlushPlan, wt0Idx int, wt0Set map[int]struct{}) (int, uint64, bool) {
+func chooseTryPushIdx(flushPlan FlushPlan, wt0Idx int) (int, uint64, bool) {
 	prevIdx, hasPrev := wt0Idx-1, wt0Idx > 0
 	succIdx, hasSucc := wt0Idx+1, wt0Idx+1 < len(flushPlan.planList)
 	if !hasPrev && !hasSucc {
 		return 0, 0, false
 	}
 	if !hasPrev {
-		if _, ok := wt0Set[succIdx]; ok {
-			panic("chooseTryPushIdx: succ in wt0")
-		}
 		return succIdx, extraWriteExpected(flushPlan.planList[succIdx]), true
 	}
 	if !hasSucc {
-		if _, ok := wt0Set[prevIdx]; ok {
-			panic("chooseTryPushIdx: prev in wt0")
-		}
 		return prevIdx, extraWriteExpected(flushPlan.planList[prevIdx]), true
-	}
-	if _, ok := wt0Set[prevIdx]; ok {
-		panic("chooseTryPushIdx: prev in wt0")
-	}
-	if _, ok := wt0Set[succIdx]; ok {
-		panic("chooseTryPushIdx: succ in wt0")
 	}
 	prevWrite := extraWriteExpected(flushPlan.planList[prevIdx])
 	succWrite := extraWriteExpected(flushPlan.planList[succIdx])
@@ -686,19 +437,15 @@ func activeMergePlan(flushPlan FlushPlan, extraWriteThreshold uint64) FlushPlan 
 		ppIdx      int
 		extraWrite uint64
 	}
-	wt0Set := make(map[int]struct{}, len(flushPlan.wt0))
-	for _, idx := range flushPlan.wt0 {
-		wt0Set[idx] = struct{}{}
-	}
 	tryPushMap := make(map[int]tryPushCandidate, len(flushPlan.wt0))
 	tryPushList := make([]tryPushCandidate, 0, len(flushPlan.wt0))
 	for _, wt0Idx := range flushPlan.wt0 {
-		tryPushIdx, extraWrite, ok := chooseTryPushIdx(flushPlan, wt0Idx, wt0Set)
+		tryPushIdx, extraWrite, ok := chooseTryPushIdx(flushPlan, wt0Idx)
 		if !ok {
 			continue
 		}
-		if _, exists := wt0Set[tryPushIdx]; exists {
-			panic("activeMergePlan: tryPush in wt0")
+		if extraWrite > 150 { // TODO: 不只extraWriteThreshold
+			continue
 		}
 		if _, exists := tryPushMap[tryPushIdx]; exists {
 			continue
@@ -721,10 +468,9 @@ func activeMergePlan(flushPlan FlushPlan, extraWriteThreshold uint64) FlushPlan 
 		if totalExtraWrite+tryPush.extraWrite > extraWriteThreshold {
 			break
 		}
-		oldWriteTo := int(flushPlan.planList[tryPush.ppIdx].WriteTo)
 		flushPlan.wt0 = append(flushPlan.wt0, tryPush.ppIdx)
 		flushPlan.planList[tryPush.ppIdx].WriteTo = 0
-		flushPlan.planList[tryPush.ppIdx].Reason = adjustedReasonForWriteToChange(oldWriteTo, 0)
+		flushPlan.planList[tryPush.ppIdx].Reason = adjustedReasonForWriteToChange(int(flushPlan.planList[tryPush.ppIdx].WriteTo), 0)
 		flushPlan.totalWriteExpected += tryPush.extraWrite
 		totalExtraWrite += tryPush.extraWrite
 		flushPlan.totalExtraWrite += tryPush.extraWrite
@@ -825,13 +571,16 @@ func formatPlanStack(stack []uint64) string {
 }
 
 type PartPlan struct {
-	High     uint64
-	low      uint64 // what use?
-	NewPages int
-	WriteTo  uint16 // 0 means rewrite all, stack.len means just flush no rewrite
-	Reason   string
-	Stack    []FileNum
-	Outputs  []uint64
+	High uint64
+	low  uint64 // what use?
+	// todo: 也许为Memtable和Collector留下线索
+	//MemTableIdxL    int
+	//MemTableKVCount int
+	NewPageCount int
+	WriteTo      uint16 // 0 means rewrite all, stack.len means just flush no rewrite
+	Reason       string
+	Stack        []FileNum
+	Outputs      []uint64
 }
 
 func newPartIdxFrom(pList []PartPlan) []pmtinternal.Part {

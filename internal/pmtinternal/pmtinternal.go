@@ -4,10 +4,80 @@ import (
 	"fmt"
 	"github.com/cockroachdb/pebble/internal/base"
 	"math"
+	"runtime"
+	"sync"
 )
 
 var EnablePMT = true
 var EnablePMTTableFormat = false
+var EnableCollector = true
+var CollectorTriggerPages = 3
+var CollectorMaxBytes uint64 = 64 << 20
+
+type FlushExtraParams struct {
+	Low  uint64
+	High uint64
+}
+
+// FlushExtraParamsByGoID stores per-goroutine extra params for passing data
+// without changing function signatures.
+var FlushExtraParamsByGoID sync.Map // map[uint64]FlushExtraParams
+
+func currentGoID() uint64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	const prefix = "goroutine "
+	if n <= len(prefix) {
+		panic("goid")
+	}
+	var id uint64
+	for i := len(prefix); i < n; i++ {
+		c := buf[i]
+		if c < '0' || c > '9' {
+			break
+		}
+		id = id*10 + uint64(c-'0')
+	}
+	if id == 0 {
+		panic("goid")
+	}
+	return id
+}
+
+func SetFlushExtraParams(low uint64, high uint64) {
+	FlushExtraParamsByGoID.Store(currentGoID(), FlushExtraParams{
+		Low:  low,
+		High: high,
+	})
+}
+
+func GetFlushExtraParams() (low uint64, high uint64, ok bool) {
+	v, ok := FlushExtraParamsByGoID.Load(currentGoID())
+	if !ok {
+		return 0, 0, false
+	}
+	p, ok := v.(FlushExtraParams)
+	if !ok {
+		panic("flush extra params type")
+	}
+	return p.Low, p.High, true
+}
+
+func GetAndDelFlushExtraParams() (low uint64, high uint64) {
+	v, ok := FlushExtraParamsByGoID.LoadAndDelete(currentGoID())
+	if !ok {
+		panic("ExtraParams !ok")
+	}
+	p, ok := v.(FlushExtraParams)
+	if !ok {
+		panic("flush extra params type")
+	}
+	return p.Low, p.High
+}
+
+func ClearFlushExtraParams() {
+	FlushExtraParamsByGoID.Delete(currentGoID())
+}
 
 const PMTPartIdxFilename = "PartIdx.json"
 const PMTFlushHistoryDirname = "flush_history"
@@ -18,15 +88,13 @@ const (
 	PlanStep1Simple PlanStep1Method = iota
 	PlanStep1V1
 	PlanStep1V2
-	PlanStep1V3
 	PlanStep1V4
 )
 
 var Step1Method = PlanStep1V1
-var Step1V2ChunkSize = 64
 var Step1V4RewriteFactor = 1.0
-var Step1V4NewWeight = 2.0
-var Step1V4OldWeight = 1.0
+var Step1V4NewWeight = 1.0
+var Step1V4OldWeight = 0.1
 
 // If totalWriteExpected is smaller than this threshold,
 // may advance compaction to help rebalance.
@@ -43,7 +111,7 @@ var NoActiveMergeUntil = 64 // 64次multiflush之前不提前压实
 
 func SetStep1Method(m PlanStep1Method) {
 	switch m {
-	case PlanStep1Simple, PlanStep1V1, PlanStep1V2, PlanStep1V3, PlanStep1V4:
+	case PlanStep1Simple, PlanStep1V1, PlanStep1V2, PlanStep1V4:
 		Step1Method = m
 	default:
 		panic(fmt.Sprintf("SetStep1Method: unknown method %d", m))

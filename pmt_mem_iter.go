@@ -64,6 +64,7 @@ func (f *flushableMemIter) computePossibleOverlaps(fn func(bounded) shouldContin
 	}
 }
 
+// TODO: 与FakeMemTable关联
 // simpleMemIter is a simple in-memory iterator implementation
 type simpleMemIter struct {
 	keys []base.InternalKey

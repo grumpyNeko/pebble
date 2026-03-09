@@ -295,12 +295,11 @@ func Test_pebble_wa(t *testing.T) {
 		options.MaxConcurrentCompactions = func() int { return 8 }
 		return options
 	})
-	defer SavePMTPartIdx(filepath.Join(path, "partidx.json"))
 
 	times := 128 // 48
 	datas := make([]uint64, 0, times<<20)
 	for i := 0; i < times; i++ {
-		path := filepath.Join(datasetPath, fmt.Sprintf("normal_plus_round_%03d.bin", i))
+		path := filepath.Join(datasetPath, fmt.Sprintf("normal_plus_round_%03d.bin", i)) // normal_plus_round_%03d or uniform_round_%03d
 		d := LoadDataFile(path)
 		datas = append(datas, d.Keys...)
 	}
@@ -410,7 +409,6 @@ func Test_pebble_r(t *testing.T) {
 		options.ReadOnly = true // important
 		return options
 	})
-	db.LoadPMTPartIdxAndRecoverMap(filepath.Join(path, "partidx.json"))
 
 	times := 128 // 48
 	datas := make([]uint64, 0, times<<20)
@@ -454,7 +452,7 @@ func Test_pmt_wa(t *testing.T) {
 	defer SavePMTPartIdx(filepath.Join(path, "partidx.json"))
 	defer dumpFlushHistory(0, path)
 
-	const flushConcurrency = 2
+	const flushConcurrency = 1
 	times := 128 // 128
 	datas := make([]uint64, 0, times<<20)
 	for i := 0; i < times; i++ {
@@ -769,48 +767,61 @@ func Test_gen_data(t *testing.T) {
 	}
 }
 
-func multilevelFlushConcurrent(db *DB, keys []uint64, v uint64, spList []PartPlan, concurrency int) {
-	if len(spList) == 0 {
+func multilevelFlushConcurrent(db *DB, keys []uint64, v uint64, pList []PartPlan, concurrency int) {
+	if len(pList) == 0 {
 		return
+	}
+	if collectorEnabled() {
+		_collectorFlushBegin()
+		defer _collectorFlushEnd()
 	}
 	if concurrency < 1 {
 		panic(`concurrency < 1`)
 	}
-	if len(spList) == 1 {
+	if len(pList) == 1 {
 		concurrency = 1 // TODO: 这么做不优雅...
 	}
-	if concurrency > len(spList) {
-		panic(`concurrency > len(spList)`)
+	if concurrency > len(pList) {
+		panic(`concurrency > len(pList)`)
 	}
 	var wg sync.WaitGroup
-	size := (len(spList) + concurrency - 1) / concurrency
+	size := (len(pList) + concurrency - 1) / concurrency
 	for g := 0; g < concurrency; g++ {
 		start := g * size
 		end := start + size
-		if end > len(spList) {
-			end = len(spList)
+		if end > len(pList) {
+			end = len(pList)
 		}
 		if start >= end {
 			continue
 		}
-		list := spList[start:end]
 		wg.Add(1)
 		go func(list []PartPlan) {
 			defer wg.Done()
-			for i := range list {
-				sp := list[i]
+			for i, plan := range list {
+				memKeys := rangeLimit(keys, plan.low, plan.High)
+				if collectorEnabled() {
+					newKVCount := len(memKeys) + collectorKVCountInRange(plan.low, plan.High)
+					newPages := kvCountToPageCount(newKVCount)
+					if newPages < pmtinternal.CollectorTriggerPages {
+						collectorAppendNextRange(plan.low, plan.High)
+						collectorAppendNextConst(memKeys, v)
+						continue
+					}
+				}
 				mem := fakeMemTable{
-					keys: rangeLimit(keys, sp.low, sp.High),
+					keys: memKeys,
 					v:    v,
 				}
+				pmtinternal.SetFlushExtraParams(plan.low, plan.High)
 				list[i].Outputs = multilevelFlushWithResult(
 					db,
 					mem,
-					sp.Stack[sp.WriteTo:],
-					outputLevelForWriteTo(sp.WriteTo),
+					plan.Stack[plan.WriteTo:],
+					outputLevelForWriteTo(plan.WriteTo),
 				)
 			}
-		}(list)
+		}(pList[start:end])
 	}
 	wg.Wait()
 }

@@ -152,6 +152,21 @@ plan(keys)
 	  flushPlan = delaySmallCompaction(flushPlan)
 	return flushPlan
 
+mergeAdjacent_wt0(planList) {
+  mergeCount = 0
+  newPlanList = []
+  for idx,p in planList
+    if p.WriteTo != 0
+      newPlanList += p
+      continue
+    if newPlanList[-1].WriteTo != 0 
+      newPlanList += p
+      continue
+    newPlanList[-1] = mergePartPlan(newPlanList[-1], p)
+    mergeCount++
+  return newPlanList, mergeCount
+}
+
 // 提前压实, 促进区间再均衡
 activeMergePlan(flushplan) {
 	pushList = []
@@ -197,8 +212,8 @@ wt0改成map, 不要多次collectWt0而是随时维护wt0
 
 # stack slot 与 pebble level
 outputLevelForWriteTo希望保持stack slot与pebble level一一对应 
-- writeTo=0 -> L6                                                                                                                                                                                                                            
-- writeTo=1 -> L5                                                                                                                                                                                                                            
+- writeTo=0 -> L6  
+- writeTo=1 -> L5 
 - writeTo=2 -> L4 
 但有例外
 stack=[L6,L5,L4], writeTo=1, 写入L5, 产生两个文件                               

@@ -418,6 +418,11 @@ func (d *DB) PMTGet(k uint64) (v uint64, found bool, tableCt int) {
 	if err := d.closed.Load(); err != nil {
 		panic(err)
 	}
+	if collectorEnabled() {
+		if cv, ok := collectorGet(k); ok {
+			return cv, true, 0
+		}
+	}
 	part, ok := pmtPartForKey(k)
 	if !ok || len(part.Stack) == 0 {
 		return 0, false, 0
@@ -487,6 +492,31 @@ func pmtPartForKey(k uint64) (pmtinternal.Part, bool) {
 		return p, true
 	}
 	return pmtinternal.Part{}, false
+}
+
+func pmtCollectorBoundsForFlush(keys []uint64, files []base.FileNum) (low uint64, high uint64, ok bool) {
+	if len(keys) > 0 {
+		part, ok := pmtPartForKey(keys[0])
+		if !ok {
+			return 0, 0, false
+		}
+		return part.Low, part.High, true
+	}
+	if len(files) > 0 {
+		info, ok := pmtinternal.SstMap[uint64(files[0])]
+		if !ok {
+			panic(fmt.Sprintf("collector flush: file %d not found in SstMap", files[0]))
+		}
+		part, ok := pmtPartForKey(info.Smallest)
+		if !ok {
+			return 0, 0, false
+		}
+		if info.Largest > part.High {
+			panic("collector flush: file cross part")
+		}
+		return part.Low, part.High, true
+	}
+	return 0, 0, false
 }
 
 type pmtPartPersist struct {
@@ -1198,6 +1228,33 @@ func multilevelFlush(db *DB, mem fakeMemTable, files []base.FileNum, outputLevel
 			pc.largest = memLargest
 		}
 	}
+
+	low, high := pmtinternal.GetAndDelFlushExtraParams()
+	// TODO: collector影响pc.smallest和pc.largest
+	pc.smallest = base.MakeInternalKey(BigEndian(low), seqNum, base.InternalKeyKindSet)
+	pc.largest = base.MakeInternalKey(BigEndian(high), seqNum, base.InternalKeyKindSet) // 注意high不需要加一
+
+	//collectorHas := false
+	//collectorLow := uint64(0)
+	//collectorHigh := uint64(0)
+	//if collectorEnabled() {
+	//	if low, high, ok := pmtCollectorBoundsForFlush(keys, files); ok {
+	//		if minK, maxK, has := collectorMinMaxInRange(low, high); has {
+	//			collectorHas = true
+	//			collectorLow = minK
+	//			collectorHigh = maxK
+	//			collectorSmallest := base.MakeInternalKey(BigEndian(minK), seqNum, base.InternalKeyKindSet)
+	//			collectorLargest := base.MakeInternalKey(BigEndian(maxK), seqNum, base.InternalKeyKindSet)
+	//			if pc.smallest.UserKey == nil || base.InternalCompare(opts.Comparer.Compare, collectorSmallest, pc.smallest) < 0 {
+	//				pc.smallest = collectorSmallest
+	//			}
+	//			if pc.largest.UserKey == nil || base.InternalCompare(opts.Comparer.Compare, collectorLargest, pc.largest) > 0 {
+	//				pc.largest = collectorLargest
+	//			}
+	//		}
+	//	}
+	//}
+
 	comp := newCompaction(pc, opts, db.timeNow(), db.objProvider, noopGrantHandle{})
 	if comp == nil {
 		panic(`why comp == nil?`)
@@ -1208,6 +1265,20 @@ func multilevelFlush(db *DB, mem fakeMemTable, files []base.FileNum, outputLevel
 		flushableMem := &flushableMemIter{iter: memIter}
 		seqNum := memIter.keys[0].SeqNum()
 		comp.flushing[0] = db.newFlushableEntry(flushableMem, base.DiskFileNum(0), seqNum)
+	}
+
+	// Add collector iterator, 这是补丁, 就该这么写
+	if collectorEnabled() {
+		collectorValidateRange(low, high)
+		flushing := make(flushableList, 2)
+		flushing[0] = comp.flushing[0]
+
+		flushableCollector := &flushableCollectorIter{
+			lower: BigEndian(low),
+			upper: BigEndian(high),
+		}
+		flushing[1] = db.newFlushableEntry(flushableCollector, base.DiskFileNum(0), seqNum)
+		comp.flushing = flushing
 	}
 
 	// TODO: 如果不执行以下几行会怎样
@@ -1249,7 +1320,10 @@ func multilevelFlushWithResult(db *DB, mem fakeMemTable, files []base.FileNum, o
 	if jobID == -1 {
 		return nil
 	}
+	return collectCompactionOutputs(jobID)
+}
 
+func collectCompactionOutputs(jobID JobID) []uint64 {
 	// Retrieve results from the map using jobID
 	compactionResultsMu.Lock()
 	outputs, ok := compactionResults[jobID]
