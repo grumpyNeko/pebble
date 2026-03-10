@@ -82,12 +82,14 @@ PartIdx + SstMap + Stack
 返回(v, found, tableCt)
 
 # pmtformat.Iter用于Get/Compact
-SeekGE/First/Next/SeekLT/Prev
-SetBounds
-Error/Close/SetContext
-按Page懒加载
-Kind<-InternalKeyKindSet
-SeqNum<-FileMetadata.LargestSeqNum
+API
+  SeekGE/First/Next/SeekLT/Prev
+  SetBounds
+  Error/Close/SetContext
+Kind?   InternalKeyKindSet
+SeqNum? Iter需要传入一个sn, 此后读出的都是它; 传入的是FileMetadata.LargestSeqNum
+FileMetadata.LargestSeqNum? 是写入文件内的InternalKey的最大SeqNum
+写入文件内的InternalKey是?
 - iter_test.go
 空表, First/Last/SeekGE/SeekLT
 First->Next、Last->Prev、SeekGE/SeekLT
@@ -107,9 +109,9 @@ PMT 分流后同样进入 newPMTIters:15，point 直接是 pmtformat.Iter，不�
 # TableFormatPMT读接入BlockCache
 其他tableformat涉及sstable.Reader/block.Reader, not pmt
 why? pmt没有footer/metaindex/index/properties
-没有tableCache和blockCache
+所以没有tableCache和blockCache
 
-pmtformat.NewIter, 用pmtCachedReadable包Readable, 传给pmtformat.NewIter, 增加BlockCache逻辑
+用pmtCachedReadable包Readable, 传给pmtformat.NewIter, 增加BlockCache逻辑
 - blockCacheHandle.GetWithReadHandle(..)
   IF hit, ..
   IF miss, alloc, read, set, release
