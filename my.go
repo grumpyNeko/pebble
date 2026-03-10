@@ -1230,30 +1230,20 @@ func multilevelFlush(db *DB, mem fakeMemTable, files []base.FileNum, outputLevel
 	}
 
 	low, high := pmtinternal.GetAndDelFlushExtraParams()
-	// TODO: collector影响pc.smallest和pc.largest
-	pc.smallest = base.MakeInternalKey(BigEndian(low), seqNum, base.InternalKeyKindSet)
-	pc.largest = base.MakeInternalKey(BigEndian(high), seqNum, base.InternalKeyKindSet) // 注意high不需要加一
-
-	//collectorHas := false
-	//collectorLow := uint64(0)
-	//collectorHigh := uint64(0)
-	//if collectorEnabled() {
-	//	if low, high, ok := pmtCollectorBoundsForFlush(keys, files); ok {
-	//		if minK, maxK, has := collectorMinMaxInRange(low, high); has {
-	//			collectorHas = true
-	//			collectorLow = minK
-	//			collectorHigh = maxK
-	//			collectorSmallest := base.MakeInternalKey(BigEndian(minK), seqNum, base.InternalKeyKindSet)
-	//			collectorLargest := base.MakeInternalKey(BigEndian(maxK), seqNum, base.InternalKeyKindSet)
-	//			if pc.smallest.UserKey == nil || base.InternalCompare(opts.Comparer.Compare, collectorSmallest, pc.smallest) < 0 {
-	//				pc.smallest = collectorSmallest
-	//			}
-	//			if pc.largest.UserKey == nil || base.InternalCompare(opts.Comparer.Compare, collectorLargest, pc.largest) > 0 {
-	//				pc.largest = collectorLargest
-	//			}
-	//		}
-	//	}
-	//}
+	//pc.smallest = base.MakeInternalKey(BigEndian(low), seqNum, base.InternalKeyKindSet)
+	//pc.largest = base.MakeInternalKey(BigEndian(high), seqNum, base.InternalKeyKindSet) // 注意high不需要加一
+	if collectorEnabled() {
+		if minK, maxK, has := collectorMinMaxInRange(low, high); has {
+			collectorSmallest := base.MakeInternalKey(BigEndian(minK), seqNum, base.InternalKeyKindSet)
+			collectorLargest := base.MakeInternalKey(BigEndian(maxK), seqNum, base.InternalKeyKindSet)
+			if base.InternalCompare(opts.Comparer.Compare, collectorSmallest, pc.smallest) < 0 {
+				pc.smallest = collectorSmallest
+			}
+			if base.InternalCompare(opts.Comparer.Compare, collectorLargest, pc.largest) > 0 {
+				pc.largest = collectorLargest
+			}
+		}
+	}
 
 	comp := newCompaction(pc, opts, db.timeNow(), db.objProvider, noopGrantHandle{})
 	if comp == nil {
