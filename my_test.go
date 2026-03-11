@@ -522,7 +522,7 @@ func printPartStat() {
 			largePartCount++
 		}
 	}
-
+	println(fmt.Sprintf("collectorKVCount=%d", len(collectorSnapshot().Keys)))
 	println(fmt.Sprintf("partCount=%d, smallPartCount=%d, largePartCount=%d, fileCount=%d, smallFileCount=%d", partCount, smallPartCount, largePartCount, fileCount, smallFileCount))
 }
 

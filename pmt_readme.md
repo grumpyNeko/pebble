@@ -41,7 +41,7 @@ newPartIdxFrom(pList) []Part {
 关闭一些Pebble的默认行为: 自动压实和移动压实
 注释掉db.flush中的maybeScheduleCompaction
 修改compaction迭代器, 增加memtable
-
+========================================================================================================================
 # TableFormatPebblev6比v1小   
 columnarblock，把key/trailer/value分列编码，固定长度数据省开销
   Header                                                                                                                                                                                                                                          
@@ -93,13 +93,8 @@ FileMetadata.LargestSeqNum? 是写入文件内的InternalKey的最大SeqNum
 First->Next、Last->Prev、SeekGE/SeekLT
 257 KV, SeekGE页尾, Next到下一页
 SeekGE(>max)=nil，SeekLT(<=min)=nil，含SetBounds       
-- 影响compaction过程
-compactAndWrite调用c.newInputIters(...) 组装迭代器
-newInputIters 里 point 走 newLevelIter(..., newIters, ...)，最终fileCacheHandle.newIters
-在PMT开关下，newIters调用pmtformat.NewIter(..)而不是sstable reader
-newRangeDelIter会拿到nil并跳过
-- 影响DB.Get
-DB.Get->getIter->getSSTableIterators, 分流到newPMTIters
+- 影响compactAndWrite和DB.Get
+判断是否启用了TableFormatPMT，若是, 调用pmtformat.NewIter(..)而不是sstable reader
 
 # TableFormatPMT读接入BlockCache
 其他tableformat涉及sstable.Reader/block.Reader, not pmt
@@ -135,8 +130,8 @@ pmt怎么加tableCache
 最小落地改动点? 
 - 去掉 openFile 里对 PMT table 的 panic，见 file_cache.go:214。
 - 给 fileCacheValue 增加 PMT reader 形态（或通用 Readable 字段），见 file_cache.go:881。                                                                                                                                                     
-- newPMTIters 从 cached value 创建 iter，并用 closeHook 做 Unref，避免每次打开文件。     
-- 
+- newPMTIters 从 cached value 创建 iter，并用 closeHook 做 Unref，避免每次打开文件。
+========================================================================================================================
 # plan step1 
 区间上层文件越小, 新数据越大, 越倾向于重写上层
 
