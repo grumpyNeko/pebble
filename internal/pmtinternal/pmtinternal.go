@@ -22,6 +22,7 @@ type FlushExtraParams struct {
 // FlushExtraParamsByGoID stores per-goroutine extra params for passing data
 // without changing function signatures.
 var FlushExtraParamsByGoID sync.Map // map[uint64]FlushExtraParams
+var CollectorDoneByGoID sync.Map    // map[uint64]bool
 
 func currentGoID() uint64 {
 	var buf [64]byte
@@ -77,6 +78,22 @@ func GetAndDelFlushExtraParams() (low uint64, high uint64) {
 
 func ClearFlushExtraParams() {
 	FlushExtraParamsByGoID.Delete(currentGoID())
+}
+
+func SetCollectorDone(done bool) {
+	CollectorDoneByGoID.Store(currentGoID(), done)
+}
+
+func GetAndDelCollectorDone() (done bool, ok bool) {
+	v, ok := CollectorDoneByGoID.LoadAndDelete(currentGoID())
+	if !ok {
+		return false, false
+	}
+	done, ok = v.(bool)
+	if !ok {
+		panic("collector done type")
+	}
+	return done, true
 }
 
 const PMTPartIdxFilename = "PartIdx.json"

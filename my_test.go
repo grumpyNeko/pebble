@@ -754,11 +754,22 @@ func multilevelFlushConcurrent(db *DB, keys []uint64, v uint64, pList []PartPlan
 			defer wg.Done()
 			for i, plan := range list {
 				memKeys := rangeLimit(keys, plan.low, plan.High)
+				collectorDone := false
+				if collectorEnabled() {
+					newKVCount := len(memKeys) + collectorKVCountInRange(plan.low, plan.High)
+					newPages := kvCountToPageCount(newKVCount)
+					if newPages < pmtinternal.CollectorTriggerPages {
+						collectorAppendNextRange(plan.low, plan.High)
+						collectorAppendNextConst(memKeys, v)
+						collectorDone = true
+					}
+				}
 				mem := fakeMemTable{
 					keys: memKeys,
 					v:    v,
 				}
 				pmtinternal.SetFlushExtraParams(plan.low, plan.High)
+				pmtinternal.SetCollectorDone(collectorDone)
 				list[i].Outputs = multilevelFlushWithResult(
 					db,
 					mem,

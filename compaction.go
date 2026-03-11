@@ -3197,6 +3197,14 @@ func (d *DB) runCompaction(
 func (d *DB) compactAndWrite(
 	jobID JobID, c *compaction, snapshots compact.Snapshots, tableFormat sstable.TableFormat,
 ) (result compact.Result) {
+	collectorDone := false
+	if c.kind == compactionKindFlushMultilevel {
+		var ok bool
+		collectorDone, ok = pmtinternal.GetAndDelCollectorDone()
+		if !ok {
+			collectorDone = false
+		}
+	}
 	// Compactions use a pool of buffers to read blocks, avoiding polluting the
 	// block cache with blocks that will not be read again. We initialize the
 	// buffer pool with a size 12. This initial size does not need to be
@@ -3275,20 +3283,9 @@ func (d *DB) compactAndWrite(
 		GrantHandle:                c.grantHandle,
 	}
 	runner := compact.NewRunner(runnerCfg, iter)
-	if collectorEnabled() {
-		low, high, ok := pmtinternal.GetFlushExtraParams()
-		if !ok {
-			panic("flush extra params !ok")
-		}
-		memKeys, v := compactAndWriteMemKeysAndValue(c)
-		newKVCount := len(memKeys) + collectorKVCountInRange(low, high)
-		newPages := kvCountToPageCount(newKVCount)
-		if newPages < pmtinternal.CollectorTriggerPages {
-			collectorAppendNextRange(low, high)
-			collectorAppendNextConst(memKeys, v)
-			result = runner.Finish()
-			goto skip
-		}
+	if collectorDone {
+		result = runner.Finish()
+		goto skip
 	}
 	for runner.MoreDataToWrite() {
 		if c.cancel.Load() {

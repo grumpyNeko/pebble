@@ -1166,24 +1166,6 @@ func rangeLimit(keys []uint64, low uint64, high uint64) []uint64 {
 	return keys[start:end]
 }
 
-func compactAndWriteMemKeysAndValue(c *compaction) (memKeys []uint64, v uint64) {
-	for _, flushing := range c.flushing {
-		mem, ok := flushing.flushable.(*flushableMemIter)
-		if !ok {
-			continue
-		}
-		memKeys = make([]uint64, len(mem.iter.keys))
-		for i := range mem.iter.keys {
-			memKeys[i] = binary.BigEndian.Uint64(mem.iter.keys[i].UserKey)
-		}
-		if len(mem.iter.vals) == 0 {
-			return memKeys, 0
-		}
-		return memKeys, binary.BigEndian.Uint64(mem.iter.vals[0])
-	}
-	return nil, 0
-}
-
 // a single flush + multi-level compaction
 // Assume batch does not overlap with other files.
 // wait for compaction to finish.
@@ -1247,10 +1229,7 @@ func multilevelFlush(db *DB, mem fakeMemTable, files []base.FileNum, outputLevel
 		}
 	}
 
-	low, high, ok := pmtinternal.GetFlushExtraParams()
-	if !ok {
-		panic("flush extra params !ok")
-	}
+	low, high := pmtinternal.GetAndDelFlushExtraParams()
 	//pc.smallest = base.MakeInternalKey(BigEndian(low), seqNum, base.InternalKeyKindSet)
 	//pc.largest = base.MakeInternalKey(BigEndian(high), seqNum, base.InternalKeyKindSet) // 注意high不需要加一
 	if collectorEnabled() {
