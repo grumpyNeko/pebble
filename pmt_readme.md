@@ -1,5 +1,3 @@
-
-
 # Part和PartIdx
 把键范围切成若干Part
 每个Part都是{key,files,..}
@@ -89,22 +87,19 @@ API
 Kind?   InternalKeyKindSet
 SeqNum? Iter需要传入一个sn, 此后读出的都是它; 传入的是FileMetadata.LargestSeqNum
 FileMetadata.LargestSeqNum? 是写入文件内的InternalKey的最大SeqNum
-写入文件内的InternalKey是?
+写入文件内的InternalKey是? 先seqNum=db.mu.versions.logSeqNum.Add(1) - 1，再newSimpleMemIter(keys, v, seqNum)把新数据全设置为同一seqnum
 - iter_test.go
 空表, First/Last/SeekGE/SeekLT
 First->Next、Last->Prev、SeekGE/SeekLT
 257 KV, SeekGE页尾, Next到下一页
 SeekGE(>max)=nil，SeekLT(<=min)=nil，含SetBounds       
-- 在compaction路径接入该迭代器
-入口是 compactAndWrite:3237，它调用 c.newInputIters(...) 组装输入迭代器。
-newInputIters 里 point 走 newLevelIter(..., newIters, ...)，最终都会落到 fileCacheHandle.newIters:541。
-在 PMT 开关下，newIters 直接分流到 newPMTIters:15，这里构造的是 pmtformat.NewIter(...)（懒加载按 page 读）而不是 sstable reader。
-newRangeDelIter 单独请求 iterRangeDeletions 时，newPMTIters 不会返回 point，也不会返回 rangedel，所以 newRangeDelIter:1076 会拿到 nil 并跳过。
-最后 rangeDelIters/rangeKeyIters 为空，compact.NewIter(cfg, pointIter, nil, nil)，即 point-only compaction。   
-- 在DB.Get路径接入该迭代器
-DB.Get 初始化 getIter 时注入 newIters: d.newIters，见 db.go:602。
-getIter 在 getSSTableIterators:263 调 g.newIters(..., iterPointKeys|iterRangeDeletions)。
-PMT 分流后同样进入 newPMTIters:15，point 直接是 pmtformat.Iter，不再经过 pmtTableReader/pmtformat.Reader。
+- 影响compaction过程
+compactAndWrite调用c.newInputIters(...) 组装迭代器
+newInputIters 里 point 走 newLevelIter(..., newIters, ...)，最终fileCacheHandle.newIters
+在PMT开关下，newIters调用pmtformat.NewIter(..)而不是sstable reader
+newRangeDelIter会拿到nil并跳过
+- 影响DB.Get
+DB.Get->getIter->getSSTableIterators, 分流到newPMTIters
 
 # TableFormatPMT读接入BlockCache
 其他tableformat涉及sstable.Reader/block.Reader, not pmt
@@ -141,6 +136,41 @@ pmt怎么加tableCache
 - 去掉 openFile 里对 PMT table 的 panic，见 file_cache.go:214。
 - 给 fileCacheValue 增加 PMT reader 形态（或通用 Readable 字段），见 file_cache.go:881。                                                                                                                                                     
 - newPMTIters 从 cached value 创建 iter，并用 closeHook 做 Unref，避免每次打开文件。     
+- 
+# plan step1 
+区间上层文件越小, 新数据越大, 越倾向于重写上层
+
+方案1
+rewritePages + nextFilePages <= newPages + b
+从上往下遍历Stack, 直到发现i层不满足, 重写i以上的层
+```
+writeTo = stack.len
+for i=stack.len-1; i>=0; i--
+  table <- Stack[i]
+  break if rewritePages + nextFilePages > a*newPages + b
+  writeTo = i
+if writeTo == 4
+  writeTo--
+```
+这个方案的问题
+newPages:860, writeTo:0, stack: [513]
+newPages:1, writeTo:3, stack: [4,4,4,5]
+newPages:0, writeTo:0, stack: [459,5,5,5]
+
+方案2
+```
+n = stack.len
+oldCost_i = 0
+for j=i+1; j>=n-1; j++
+  oldCost_i += (j-i) * tablesize_j
+cost_i = r*tablesize_i - w_new * (n-i) - oldCost_i
+```
+r*tablesize_i表示 重写输出层
+w_new * (n-i)表示 新数据
+oldCost_i表示     已有的文件
+
+实现方案2为step1V4
+修正项: 在重叠度过高时促进上层压实，当n>C且i<T时, 把cost_i减去B
 
 # plan
 ```
@@ -228,7 +258,7 @@ stack变成[L6,L5,L5], writeTo=2, 写入L4, 但输入中有L5文件
 - 都放在L0
 - 修改输出文件的level, 让slot和level对应
 
-都放在L0
+都放在L0?
   设置L0 sublevel数量
   由于pmt的multilevelflush的输出总是最新的, 直接放L0(最上面), 不会导致老数据掩盖新数据(即使没有seqnum)
 反对? 删旧L0文件+加新L0文件，重建sublevels
@@ -252,3 +282,16 @@ func newCompactionInputLevelSlice(
 - 去掉“outputLevel 不能浅于输入最大层”的限制 
 - inputs按实际输入层收集，不按startLevel..outputLevel连续区间收集
 - 给adjustedOutputLevel加了下限，避免opts.Level(-1)
+
+# 注意
+妥协: collector需要计算新数据量
+  step1Simple不计算
+  step1V4重复计算
+
+妥协: collectorIter读出的seqnum为0
+
+妥协: collectorIter现在只被包成flushableCollectorIter用作compaction的输入，不在pebble的getIter/readState读路径里
+
+难点: collector影响compactAndWrite, 只是为了更新Version
+
+妥协: MustGet现在不panic

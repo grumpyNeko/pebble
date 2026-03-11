@@ -3275,6 +3275,21 @@ func (d *DB) compactAndWrite(
 		GrantHandle:                c.grantHandle,
 	}
 	runner := compact.NewRunner(runnerCfg, iter)
+	if collectorEnabled() {
+		low, high, ok := pmtinternal.GetFlushExtraParams()
+		if !ok {
+			panic("flush extra params !ok")
+		}
+		memKeys, v := compactAndWriteMemKeysAndValue(c)
+		newKVCount := len(memKeys) + collectorKVCountInRange(low, high)
+		newPages := kvCountToPageCount(newKVCount)
+		if newPages < pmtinternal.CollectorTriggerPages {
+			collectorAppendNextRange(low, high)
+			collectorAppendNextConst(memKeys, v)
+			result = runner.Finish()
+			goto skip
+		}
+	}
 	for runner.MoreDataToWrite() {
 		if c.cancel.Load() {
 			return runner.Finish().WithError(ErrCancelledCompaction)
@@ -3289,6 +3304,7 @@ func (d *DB) compactAndWrite(
 		d.opts.Experimental.CPUWorkPermissionGranter.CPUWorkDone(cpuWorkHandle)
 	}
 	result = runner.Finish()
+skip:
 	if result.Err == nil {
 		result.Err = d.objProvider.Sync()
 	}

@@ -86,23 +86,21 @@ type PlanStep1Method uint8
 
 const (
 	PlanStep1Simple PlanStep1Method = iota
-	PlanStep1V1
-	PlanStep1V2
 	PlanStep1V4
 )
 
-var Step1Method = PlanStep1V1
+var Step1Method = PlanStep1V4
 var Step1V4RewriteFactor = 1.0
-var Step1V4NewWeight = 1.0
+var Step1V4NewWeight = 0.9
 var Step1V4OldWeight = 0.1
 
 // If totalWriteExpected is smaller than this threshold,
 // may advance compaction to help rebalance.
-var WriteThresholdInPages0 uint64 = 5000
+var WriteThresholdInPages0 uint64 = 5500
 
 // If totalWriteExpected is larger than this threshold,
 // small wt0 compactions may be delayed.
-var WriteThresholdInPages1 uint64 = 5500
+var WriteThresholdInPages1 uint64 = 6000
 
 // When delaying compaction above WriteThresholdInPages1,
 // only wt0 parts with NewPages smaller than this threshold are delayed.
@@ -111,7 +109,7 @@ var NoActiveMergeUntil = 64 // 64次multiflush之前不提前压实
 
 func SetStep1Method(m PlanStep1Method) {
 	switch m {
-	case PlanStep1Simple, PlanStep1V1, PlanStep1V2, PlanStep1V4:
+	case PlanStep1Simple, PlanStep1V4:
 		Step1Method = m
 	default:
 		panic(fmt.Sprintf("SetStep1Method: unknown method %d", m))

@@ -444,7 +444,7 @@ func activeMergePlan(flushPlan FlushPlan, extraWriteThreshold uint64) FlushPlan 
 		if !ok {
 			continue
 		}
-		if extraWrite > 150 { // TODO: 不只extraWriteThreshold
+		if extraWrite > 500 { // TODO: 不只extraWriteThreshold
 			continue
 		}
 		if _, exists := tryPushMap[tryPushIdx]; exists {
@@ -469,8 +469,9 @@ func activeMergePlan(flushPlan FlushPlan, extraWriteThreshold uint64) FlushPlan 
 			break
 		}
 		flushPlan.wt0 = append(flushPlan.wt0, tryPush.ppIdx)
-		flushPlan.planList[tryPush.ppIdx].WriteTo = 0
 		flushPlan.planList[tryPush.ppIdx].Reason = adjustedReasonForWriteToChange(int(flushPlan.planList[tryPush.ppIdx].WriteTo), 0)
+		flushPlan.planList[tryPush.ppIdx].WriteTo = 0
+
 		flushPlan.totalWriteExpected += tryPush.extraWrite
 		totalExtraWrite += tryPush.extraWrite
 		flushPlan.totalExtraWrite += tryPush.extraWrite

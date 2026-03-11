@@ -60,12 +60,7 @@ func collectorRangeBounds(keys []uint64, low, high uint64) (start int, end int) 
 }
 
 func collectorKVCountInRange(low, high uint64) int {
-	if !collectorEnabled() {
-		return 0
-	}
-	collectorMu.Lock()
-	defer collectorMu.Unlock()
-	start, end := collectorRangeBounds(CurrCollector.Keys, low, high)
+	start, end := seekKeys(CurrCollector.Keys, low, high)
 	return end - start
 }
 

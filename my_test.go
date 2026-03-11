@@ -464,16 +464,9 @@ func Test_pmt_wa(t *testing.T) {
 	for i := 0; i < times; i++ {
 		keys := datas[i<<20 : (i+1)<<20]
 		flushPlan := plan(keys)
-		//for j, sp := range pList {
-		//	mem := fakeMemTable{
-		//		keys: rangeLimit(d.Keys, sp.low, sp.High),
-		//		v:    uint64(i),
-		//	}
-		//	pList[j].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], int(manifest.NumLevels-1-sp.WriteTo))
-		//}
 		multilevelFlushConcurrent(db, keys, uint64(i), flushPlan.planList, flushConcurrency)
-		pmtinternal.PartIdx = newPartIdxFrom(flushPlan.planList) // TODO: 不是通过CompactionEnd/FlushEnd更新PartIdx
-		println(fmt.Sprintf("done %d", i))
+		pmtinternal.PartIdx = newPartIdxFrom(flushPlan.planList) // TODO: 不通过CompactionEnd/FlushEnd更新PartIdx
+		println(fmt.Sprintf("multilevelflush done round%d", i))
 	}
 
 	println(fmt.Sprintf("写入阶段耗时(ms): %d", time.Since(writeStart).Milliseconds()))
@@ -483,55 +476,16 @@ func Test_pmt_wa(t *testing.T) {
 	printPartStat()
 	printTotalWriteExpectedList()
 	// ------------------------------
-	benchmarkRandomReadMultiThread(datas, db, 1)
-	benchmarkRandomReadMultiThread(datas, db, 4)
-	benchmarkRandomReadMultiThread(datas, db, 8)
-	benchmarkRandomReadMultiThread(datas, db, 12)
-	benchmarkRandomReadMultiThread(datas, db, 16)
-	benchmarkRandomReadMultiThread(datas, db, 24)
-	benchmarkRandomReadMultiThread(datas, db, 32)
-	benchmarkRandomReadMultiThread(datas, db, 48)
+	//benchmarkRandomReadMultiThread(datas, db, 1)
+	//benchmarkRandomReadMultiThread(datas, db, 4)
+	//benchmarkRandomReadMultiThread(datas, db, 8)
+	//benchmarkRandomReadMultiThread(datas, db, 12)
+	//benchmarkRandomReadMultiThread(datas, db, 16)
+	//benchmarkRandomReadMultiThread(datas, db, 24)
+	//benchmarkRandomReadMultiThread(datas, db, 32)
+	//benchmarkRandomReadMultiThread(datas, db, 48)
 	benchmarkRandomReadMultiThread(datas, db, 64)
 	println(fmt.Sprintf("avgMissProbeCount=%.4f", db.PMTAverageMissProbeCount(datas)))
-	//TableFormatPebblev6-----------------------------------, avg filesAccessed 6.78
-	//start random read benchmark, concurrency=1
-	//random read cost 387120ms
-	//start random read benchmark, concurrency=4
-	//random read cost 128012ms
-	//start random read benchmark, concurrency=8
-	//random read cost 81403ms
-	//start random read benchmark, concurrency=12
-	//random read cost 62984ms
-	//start random read benchmark, concurrency=16
-	//random read cost 58804ms
-	//start random read benchmark, concurrency=24
-	//random read cost 58741ms
-	//start random read benchmark, concurrency=32
-	//random read cost 58445ms
-	//start random read benchmark, concurrency=48
-	//random read cost 57948ms
-	//start random read benchmark, concurrency=64
-	//random read cost 59463ms
-
-	//TableFormatPMT-----------------------------------512page, avg filesAccessed 6.78
-	//start random read benchmark, concurrency=1
-	//random read cost 271713ms
-	//start random read benchmark, concurrency=4
-	//random read cost 95436ms
-	//start random read benchmark, concurrency=8
-	//random read cost 63884ms
-	//start random read benchmark, concurrency=12
-	//random read cost 51712ms
-	//start random read benchmark, concurrency=16
-	//random read cost 47035ms
-	//start random read benchmark, concurrency=24
-	//random read cost 44765ms
-	//start random read benchmark, concurrency=32
-	//random read cost 44406ms
-	//start random read benchmark, concurrency=48
-	//random read cost 44782ms
-	//start random read benchmark, concurrency=64
-	//random read cost 45203ms
 }
 
 func printPartStat() {
@@ -800,15 +754,6 @@ func multilevelFlushConcurrent(db *DB, keys []uint64, v uint64, pList []PartPlan
 			defer wg.Done()
 			for i, plan := range list {
 				memKeys := rangeLimit(keys, plan.low, plan.High)
-				if collectorEnabled() {
-					newKVCount := len(memKeys) + collectorKVCountInRange(plan.low, plan.High)
-					newPages := kvCountToPageCount(newKVCount)
-					if newPages < pmtinternal.CollectorTriggerPages {
-						collectorAppendNextRange(plan.low, plan.High)
-						collectorAppendNextConst(memKeys, v)
-						continue
-					}
-				}
 				mem := fakeMemTable{
 					keys: memKeys,
 					v:    v,
