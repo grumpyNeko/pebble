@@ -590,6 +590,8 @@ func Test_concurrent(t *testing.T) {
 			keys: []uint64{1, 2, 3},
 			v:    1,
 		}
+		pmtinternal.ExtraParam.FlushExtraParams.Set(1, 3)
+		pmtinternal.ExtraParam.CollectorDone.Set(false)
 		multilevelFlushWithResult(
 			db,
 			mem,
@@ -604,6 +606,8 @@ func Test_concurrent(t *testing.T) {
 			keys: []uint64{100, 101, 102},
 			v:    2,
 		}
+		pmtinternal.ExtraParam.FlushExtraParams.Set(100, 102)
+		pmtinternal.ExtraParam.CollectorDone.Set(false)
 		multilevelFlushWithResult(
 			db,
 			mem,
@@ -768,8 +772,8 @@ func multilevelFlushConcurrent(db *DB, keys []uint64, v uint64, pList []PartPlan
 					keys: memKeys,
 					v:    v,
 				}
-				pmtinternal.SetFlushExtraParams(plan.low, plan.High)
-				pmtinternal.SetCollectorDone(collectorDone)
+				pmtinternal.ExtraParam.FlushExtraParams.Set(plan.low, plan.High)
+				pmtinternal.ExtraParam.CollectorDone.Set(collectorDone)
 				list[i].Outputs = multilevelFlushWithResult(
 					db,
 					mem,
@@ -875,6 +879,8 @@ func Test_multilevelFlush(t *testing.T) {
 			keys: rangeLimit(keys, sp.low, sp.High),
 			v:    1,
 		}
+		pmtinternal.ExtraParam.FlushExtraParams.Set(sp.low, sp.High)
+		pmtinternal.ExtraParam.CollectorDone.Set(false)
 		pList[i].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], outputLevelForWriteTo(sp.WriteTo))
 	}
 	pmtinternal.PartIdx = newPartIdxFrom(pList)
@@ -902,6 +908,8 @@ func Test_multilevelFlush(t *testing.T) {
 			keys: rangeLimit(keys, sp.low, sp.High),
 			v:    2,
 		}
+		pmtinternal.ExtraParam.FlushExtraParams.Set(sp.low, sp.High)
+		pmtinternal.ExtraParam.CollectorDone.Set(false)
 		pList[i].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], outputLevelForWriteTo(sp.WriteTo))
 	}
 	pmtinternal.PartIdx = newPartIdxFrom(pList)
@@ -936,6 +944,8 @@ func Test_multilevelFlush(t *testing.T) {
 			keys: rangeLimit(keys, sp.low, sp.High),
 			v:    3,
 		}
+		pmtinternal.ExtraParam.FlushExtraParams.Set(sp.low, sp.High)
+		pmtinternal.ExtraParam.CollectorDone.Set(false)
 		pList[i].Outputs = multilevelFlushWithResult(db, mem, sp.Stack[sp.WriteTo:], outputLevelForWriteTo(sp.WriteTo))
 	}
 	pmtinternal.PartIdx = newPartIdxFrom(pList)

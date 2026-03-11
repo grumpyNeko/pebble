@@ -3199,11 +3199,7 @@ func (d *DB) compactAndWrite(
 ) (result compact.Result) {
 	collectorDone := false
 	if c.kind == compactionKindFlushMultilevel {
-		var ok bool
-		collectorDone, ok = pmtinternal.GetAndDelCollectorDone()
-		if !ok {
-			collectorDone = false
-		}
+		collectorDone = pmtinternal.ExtraParam.CollectorDone.GetAndDel()
 	}
 	// Compactions use a pool of buffers to read blocks, avoiding polluting the
 	// block cache with blocks that will not be read again. We initialize the

@@ -10,10 +10,85 @@ type FlushExtraParams struct {
 	High uint64
 }
 
-// FlushExtraParamsByGoID stores per-goroutine extra params for passing data
-// without changing function signatures.
-var FlushExtraParamsByGoID sync.Map // map[uint64]FlushExtraParams
-var CollectorDoneByGoID sync.Map    // map[uint64]bool
+type flushExtraParamsByGoID struct {
+	byGoID sync.Map
+}
+
+func (e *flushExtraParamsByGoID) Set(low uint64, high uint64) {
+	e.byGoID.Store(currentGoID(), FlushExtraParams{
+		Low:  low,
+		High: high,
+	})
+}
+
+func (e *flushExtraParamsByGoID) Get() (low uint64, high uint64, ok bool) {
+	v, ok := e.byGoID.Load(currentGoID())
+	if !ok {
+		return 0, 0, false
+	}
+	p, ok := v.(FlushExtraParams)
+	if !ok {
+		panic("flush extra params type")
+	}
+	return p.Low, p.High, true
+}
+
+func (e *flushExtraParamsByGoID) GetAndDel() (low uint64, high uint64) {
+	v, ok := e.byGoID.LoadAndDelete(currentGoID())
+	if !ok {
+		panic("flush extra params !ok")
+	}
+	p, ok := v.(FlushExtraParams)
+	if !ok {
+		panic("flush extra params type")
+	}
+	return p.Low, p.High
+}
+
+func (e *flushExtraParamsByGoID) Clear() {
+	e.byGoID.Delete(currentGoID())
+}
+
+type collectorDoneByGoID struct {
+	byGoID sync.Map
+}
+
+func (e *collectorDoneByGoID) Set(done bool) {
+	e.byGoID.Store(currentGoID(), done)
+}
+
+func (e *collectorDoneByGoID) Get() (done bool, ok bool) {
+	v, ok := e.byGoID.Load(currentGoID())
+	if !ok {
+		return false, false
+	}
+	done, ok = v.(bool)
+	if !ok {
+		panic("collector done type")
+	}
+	return done, true
+}
+
+func (e *collectorDoneByGoID) GetAndDel() bool {
+	v, ok := e.byGoID.LoadAndDelete(currentGoID())
+	if !ok {
+		panic("collector done !ok")
+	}
+	done, ok := v.(bool)
+	if !ok {
+		panic("collector done type")
+	}
+	return done
+}
+
+func (e *collectorDoneByGoID) Clear() {
+	e.byGoID.Delete(currentGoID())
+}
+
+var ExtraParam = struct {
+	FlushExtraParams flushExtraParamsByGoID
+	CollectorDone    collectorDoneByGoID
+}{}
 
 func currentGoID() uint64 {
 	var buf [64]byte
@@ -34,55 +109,4 @@ func currentGoID() uint64 {
 		panic("goid")
 	}
 	return id
-}
-
-func SetFlushExtraParams(low uint64, high uint64) {
-	FlushExtraParamsByGoID.Store(currentGoID(), FlushExtraParams{
-		Low:  low,
-		High: high,
-	})
-}
-
-func GetFlushExtraParams() (low uint64, high uint64, ok bool) {
-	v, ok := FlushExtraParamsByGoID.Load(currentGoID())
-	if !ok {
-		return 0, 0, false
-	}
-	p, ok := v.(FlushExtraParams)
-	if !ok {
-		panic("flush extra params type")
-	}
-	return p.Low, p.High, true
-}
-
-func GetAndDelFlushExtraParams() (low uint64, high uint64) {
-	v, ok := FlushExtraParamsByGoID.LoadAndDelete(currentGoID())
-	if !ok {
-		panic("ExtraParams !ok")
-	}
-	p, ok := v.(FlushExtraParams)
-	if !ok {
-		panic("flush extra params type")
-	}
-	return p.Low, p.High
-}
-
-func ClearFlushExtraParams() {
-	FlushExtraParamsByGoID.Delete(currentGoID())
-}
-
-func SetCollectorDone(done bool) {
-	CollectorDoneByGoID.Store(currentGoID(), done)
-}
-
-func GetAndDelCollectorDone() (done bool, ok bool) {
-	v, ok := CollectorDoneByGoID.LoadAndDelete(currentGoID())
-	if !ok {
-		return false, false
-	}
-	done, ok = v.(bool)
-	if !ok {
-		panic("collector done type")
-	}
-	return done, true
 }

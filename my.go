@@ -1229,7 +1229,7 @@ func multilevelFlush(db *DB, mem fakeMemTable, files []base.FileNum, outputLevel
 		}
 	}
 
-	low, high := pmtinternal.GetAndDelFlushExtraParams()
+	low, high := pmtinternal.ExtraParam.FlushExtraParams.GetAndDel()
 	//pc.smallest = base.MakeInternalKey(BigEndian(low), seqNum, base.InternalKeyKindSet)
 	//pc.largest = base.MakeInternalKey(BigEndian(high), seqNum, base.InternalKeyKindSet) // 注意high不需要加一
 	if collectorEnabled() {
