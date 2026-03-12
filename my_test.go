@@ -289,7 +289,7 @@ func Test_pebble_wa(t *testing.T) {
 		//options.FS = vfs.Default
 		options.DisableAutomaticCompactions = false
 
-		options.FileFormat = sstable.TableFormatRocksDBv2
+		options.FileFormat = sstable.TableFormatLevelDB
 		pagesize := 4 << 10                        // 4KB
 		options.CacheSize = int64(1024 * pagesize) //
 		options.MaxConcurrentCompactions = func() int { return 8 }
@@ -432,13 +432,14 @@ func Test_pebble_r(t *testing.T) {
 // 128, 写耗时: 195638,269629,312484,276104,225041=>596.42 Kops
 func Test_pmt_wa(t *testing.T) {
 	path := "ww/pmt"
+	dataset := "normal_plus" // normal_plus_round_%03d or uniform_round_%03d
 	db := MustDB(path, true, func(options *Options) *Options {
 		options.FS = vfs.Default
 
 		pmtinternal.SetStep1Method(pmtinternal.PlanStep1V4)
-		pmtinternal.EnablePMTTableFormat = true
-		options.FileFormat = sstable.TableFormatPMT0
-		//options.FileFormat = sstable.TableFormatPebblev6
+		//pmtinternal.EnablePMTTableFormat = true
+		//options.FileFormat = sstable.TableFormatPMT0
+		options.FileFormat = sstable.TableFormatLevelDB
 
 		pagesize := 4 << 10                             // 4KB
 		options.CacheSize = int64(1024 * 16 * pagesize) //
@@ -450,10 +451,10 @@ func Test_pmt_wa(t *testing.T) {
 	defer dumpFlushHistory(0, path)
 
 	const flushConcurrency = 1
-	times := 32 // 128
+	times := 128 // 128
 	datas := make([]uint64, 0, times<<20)
 	for i := 0; i < times; i++ {
-		path := filepath.Join(datasetPath, fmt.Sprintf("normal_plus_round_%03d.bin", i)) // normal_plus_round_%03d or uniform_round_%03d
+		path := filepath.Join(datasetPath, fmt.Sprintf("%s_round_%03d.bin", dataset, i))
 		d := LoadDataFile(path)
 		datas = append(datas, d.Keys...)
 	}
@@ -474,15 +475,15 @@ func Test_pmt_wa(t *testing.T) {
 	printPMTStat()
 	printTotalWriteExpectedList()
 	// ------------------------------
-	//benchmarkRandomReadMultiThread(datas, db, 1)
-	//benchmarkRandomReadMultiThread(datas, db, 4)
-	//benchmarkRandomReadMultiThread(datas, db, 8)
-	//benchmarkRandomReadMultiThread(datas, db, 12)
-	//benchmarkRandomReadMultiThread(datas, db, 16)
-	//benchmarkRandomReadMultiThread(datas, db, 24)
-	//benchmarkRandomReadMultiThread(datas, db, 32)
-	//benchmarkRandomReadMultiThread(datas, db, 48)
-	//benchmarkRandomReadMultiThread(datas, db, 64)
+	benchmarkRandomReadMultiThread(datas, db, 1)
+	benchmarkRandomReadMultiThread(datas, db, 4)
+	benchmarkRandomReadMultiThread(datas, db, 8)
+	benchmarkRandomReadMultiThread(datas, db, 12)
+	benchmarkRandomReadMultiThread(datas, db, 16)
+	benchmarkRandomReadMultiThread(datas, db, 24)
+	benchmarkRandomReadMultiThread(datas, db, 32)
+	benchmarkRandomReadMultiThread(datas, db, 48)
+	benchmarkRandomReadMultiThread(datas, db, 64)
 	println(fmt.Sprintf("avgMissProbeCount=%.4f", db.PMTAverageMissProbeCount(datas)))
 }
 

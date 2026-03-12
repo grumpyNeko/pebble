@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/sstable/pmtformat"
@@ -22,6 +23,7 @@ func Test_TableFormat(t *testing.T) {
 	)
 
 	maxEntries := pmtformat.MaxEntriesPerTable()
+	// generate keys and vals
 	rng := rand.New(rand.NewSource(20260306))
 	keySet := make(map[uint64]struct{}, maxEntries)
 	keys := make([]uint64, 0, maxEntries)
@@ -34,7 +36,6 @@ func Test_TableFormat(t *testing.T) {
 		keys = append(keys, k)
 	}
 	slices.Sort(keys)
-
 	vals := make([]uint64, len(keys))
 	for i := range vals {
 		vals[i] = rng.Uint64()
@@ -49,10 +50,45 @@ func Test_TableFormat(t *testing.T) {
 		warmupN = len(queries)
 	}
 
-	levelElapsed := measureRandomPointLookupLevelDB(
-		t, keys, vals, queries, warmupN, SnappyCompression, 16,
-	)
-	pmtElapsed := measureRandomPointLookupPMT(t, keys, vals, queries, warmupN)
+	levelMem := vfs.NewMem()
+	const levelFilename = "point_lookup_compare_leveldb.sst"
+	err := buildSST(levelMem, levelFilename, keys, vals, 0, sstable.WriterOptions{
+		TableFormat:          sstable.TableFormatLevelDB,
+		Compression:          SnappyCompression,
+		BlockRestartInterval: 16,
+	})
+	if err != nil {
+		t.Fatalf("build leveldb sstable failed: %v", err)
+	}
+	logSSTSize(t, levelMem, levelFilename, "leveldb")
+
+	pmtMem := vfs.NewMem()
+	const pmtFilename = "point_lookup_compare_pmt.sst"
+	err = buildSST(pmtMem, pmtFilename, keys, vals, 1, sstable.WriterOptions{
+		TableFormat: sstable.TableFormatPMT0,
+	})
+	if err != nil {
+		t.Fatalf("build pmt sstable failed: %v", err)
+	}
+	logSSTSize(t, pmtMem, pmtFilename, "pmt")
+
+	levelIter, levelClose, err := openLevelDBIter(levelMem, levelFilename)
+	if err != nil {
+		t.Fatalf("open leveldb iter failed: %v", err)
+	}
+	levelElapsed := benchmarkRandomPointLookup(levelIter, queries, warmupN)
+	if err := levelClose(); err != nil {
+		t.Fatalf("close leveldb iter failed: %v", err)
+	}
+
+	pmtIter, pmtClose, err := openPMTIter(pmtMem, pmtFilename, base.SeqNum(1))
+	if err != nil {
+		t.Fatalf("open pmt iter failed: %v", err)
+	}
+	pmtElapsed := benchmarkRandomPointLookup(pmtIter, queries, warmupN)
+	if err := pmtClose(); err != nil {
+		t.Fatalf("close pmt iter failed: %v", err)
+	}
 
 	levelNSPerOp := float64(levelElapsed.Nanoseconds()) / float64(queryCount)
 	pmtNSPerOp := float64(pmtElapsed.Nanoseconds()) / float64(queryCount)
@@ -81,120 +117,91 @@ func runRandomPointLookups(iter base.InternalIterator, queries []uint64) time.Du
 	return time.Since(start)
 }
 
-func measureRandomPointLookupLevelDB(
-	t *testing.T,
-	keys []uint64,
-	vals []uint64,
-	queries []uint64,
-	warmupN int,
-	compression Compression,
-	blockRestartInterval int,
+func benchmarkRandomPointLookup(
+	iter base.InternalIterator, queries []uint64, warmupN int,
 ) time.Duration {
-	t.Helper()
-
-	mem := vfs.NewMem()
-	const filename = "point_lookup_compare_leveldb.sst"
-	f, err := mem.Create(filename, vfs.WriteCategoryUnspecified)
-	if err != nil {
-		t.Fatalf("create sstable failed: %v", err)
+	if warmupN > 0 {
+		_ = runRandomPointLookups(iter, queries[:warmupN])
 	}
+	return runRandomPointLookups(iter, queries)
+}
 
-	w := sstable.NewRawWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-		TableFormat:          sstable.TableFormatLevelDB,
-		Compression:          compression,
-		BlockRestartInterval: blockRestartInterval,
-	})
+func buildSST(
+	fs vfs.FS, filename string, keys []uint64, vals []uint64, seqNum base.SeqNum, writerOpts sstable.WriterOptions,
+) error {
+	f, err := fs.Create(filename, vfs.WriteCategoryUnspecified)
+	if err != nil {
+		return err
+	}
+	w := sstable.NewRawWriter(objstorageprovider.NewFileWritable(f), writerOpts)
 	for i, k := range keys {
-		if err := w.Add(base.MakeInternalKey(BigEndian(k), 0, base.InternalKeyKindSet), BigEndian(vals[i]), false /* forceObsolete */); err != nil {
-			t.Fatalf("writer.Add failed (leveldb key=%d): %v", k, err)
+		err := w.Add(
+			base.MakeInternalKey(BigEndian(k), seqNum, base.InternalKeyKindSet),
+			BigEndian(vals[i]),
+			false, /* forceObsolete */
+		)
+		if err != nil {
+			_ = w.Close()
+			return err
 		}
 	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("writer.Close failed (leveldb): %v", err)
-	}
-	levelInfo, err := mem.Stat(filename)
-	if err != nil {
-		t.Fatalf("stat leveldb sstable failed: %v", err)
-	}
-	t.Logf("leveldb file size=%d bytes", levelInfo.Size())
+	return w.Close()
+}
 
-	rf, err := mem.Open(filename)
+func logSSTSize(t *testing.T, fs vfs.FS, filename string, label string) {
+	t.Helper()
+	info, err := fs.Stat(filename)
 	if err != nil {
-		t.Fatalf("open sstable failed: %v", err)
+		t.Fatalf("stat %s sstable failed: %v", label, err)
 	}
-	readable, err := sstable.NewSimpleReadable(rf)
+	t.Logf("%s file size=%d bytes", label, info.Size())
+}
+
+func openReadable(fs vfs.FS, filename string) (objstorage.Readable, error) {
+	f, err := fs.Open(filename)
 	if err != nil {
-		t.Fatalf("new simple readable failed: %v", err)
+		return nil, err
+	}
+	return sstable.NewSimpleReadable(f)
+}
+
+func openLevelDBIter(
+	fs vfs.FS, filename string,
+) (base.InternalIterator, func() error, error) {
+	readable, err := openReadable(fs, filename)
+	if err != nil {
+		return nil, nil, err
 	}
 	reader, err := sstable.NewReader(context.Background(), readable, sstable.ReaderOptions{})
 	if err != nil {
-		t.Fatalf("new sstable reader failed: %v", err)
+		_ = readable.Close()
+		return nil, nil, err
 	}
 	iter, err := reader.NewIter(sstable.NoTransforms, nil, nil)
 	if err != nil {
-		t.Fatalf("new sstable iterator failed: %v", err)
+		_ = reader.Close()
+		return nil, nil, err
 	}
-	if warmupN > 0 {
-		_ = runRandomPointLookups(iter, queries[:warmupN])
+	closeFn := func() error {
+		if err := iter.Close(); err != nil {
+			return err
+		}
+		return reader.Close()
 	}
-	elapsed := runRandomPointLookups(iter, queries)
-	if err := iter.Close(); err != nil {
-		t.Fatalf("close sstable iter failed: %v", err)
-	}
-	if err := reader.Close(); err != nil {
-		t.Fatalf("close sstable reader failed: %v", err)
-	}
-	return elapsed
+	return iter, closeFn, nil
 }
 
-func measureRandomPointLookupPMT(
-	t *testing.T, keys []uint64, vals []uint64, queries []uint64, warmupN int,
-) time.Duration {
-	t.Helper()
-
-	mem := vfs.NewMem()
-	const filename = "point_lookup_compare_pmt.sst"
-	f, err := mem.Create(filename, vfs.WriteCategoryUnspecified)
+func openPMTIter(
+	fs vfs.FS, filename string, seqNum base.SeqNum,
+) (base.InternalIterator, func() error, error) {
+	readable, err := openReadable(fs, filename)
 	if err != nil {
-		t.Fatalf("create pmt sstable failed: %v", err)
+		return nil, nil, err
 	}
-
-	w := sstable.NewRawWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-		TableFormat: sstable.TableFormatPMT0,
-	})
-	for i, k := range keys {
-		if err := w.Add(base.MakeInternalKey(BigEndian(k), 1, base.InternalKeyKindSet), BigEndian(vals[i]), false /* forceObsolete */); err != nil {
-			t.Fatalf("writer.Add failed (pmt key=%d): %v", k, err)
-		}
-	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("writer.Close failed (pmt): %v", err)
-	}
-	pmtInfo, err := mem.Stat(filename)
+	iter, err := pmtformat.NewIter(readable, readable.Size(), seqNum)
 	if err != nil {
-		t.Fatalf("stat pmt sstable failed: %v", err)
+		_ = readable.Close()
+		return nil, nil, err
 	}
-	t.Logf("pmt file size=%d bytes", pmtInfo.Size())
-
-	rf, err := mem.Open(filename)
-	if err != nil {
-		t.Fatalf("open pmt sstable failed: %v", err)
-	}
-	readable, err := sstable.NewSimpleReadable(rf)
-	if err != nil {
-		t.Fatalf("new simple readable failed: %v", err)
-	}
-
-	iter, err := pmtformat.NewIter(readable, readable.Size(), base.SeqNum(1))
-	if err != nil {
-		t.Fatalf("new PMT iter failed: %v", err)
-	}
-	if warmupN > 0 {
-		_ = runRandomPointLookups(iter, queries[:warmupN])
-	}
-	elapsed := runRandomPointLookups(iter, queries)
-	if err := iter.Close(); err != nil {
-		t.Fatalf("close PMT iter failed: %v", err)
-	}
-	return elapsed
+	return iter, iter.Close, nil
 }

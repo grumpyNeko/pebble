@@ -23,6 +23,7 @@ require (
 	github.com/prometheus/client_model v0.2.1-0.20210607210712-147c58e9608a
 	github.com/spf13/cobra v1.0.0
 	github.com/stretchr/testify v1.9.0
+	github.com/syndtr/goleveldb v1.0.1-0.20190318030020-c3a204f8e965
 	golang.org/x/exp v0.0.0-20230626212559-97b1e661b5df
 	golang.org/x/perf v0.0.0-20230113213139-801c7ef9e5c5
 	golang.org/x/sync v0.11.0

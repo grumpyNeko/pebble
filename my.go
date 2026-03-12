@@ -139,7 +139,7 @@ func pmtOptions() *Options {
 			 c.startLevel.files.Len() == 1
 		   要求L0只有一个文件, 有点蠢
 	*/
-	opts.L0CompactionThreshold = 3
+	opts.L0CompactionThreshold = 5
 	opts.MaxConcurrentCompactions = func() int { return 8 }
 	const pagesize = 4096
 	opts.CacheSize = 256 * pagesize
