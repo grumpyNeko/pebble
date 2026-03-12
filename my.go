@@ -96,7 +96,7 @@ func pmtOptions() *Options {
 	opts := &Options{
 		DisableAutomaticCompactions: true,
 		FlushSplitBytes:             1 << 21, // 2MB, 512 page
-		DisableWAL:                  true,    // 实际上无用...
+		DisableWAL:                  true,    // 不完全有效
 		FS:                          vfs.NewMem(),
 		MemTableStopWritesThreshold: 2, // must >= 2
 
@@ -115,7 +115,7 @@ func pmtOptions() *Options {
 		},
 		L0StopWritesThreshold: 1024,
 	}
-	opts.Experimental.MultiLevelCompactionHeuristic = NoMultiLevel{} //WriteAmpHeuristic{} // TODO: ? NoMultiLevel{}
+	opts.Experimental.MultiLevelCompactionHeuristic = NoMultiLevel{}
 	opts.Experimental.EnableColumnarBlocks = func() bool {
 		return false
 	}
