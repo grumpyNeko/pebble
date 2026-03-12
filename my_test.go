@@ -286,12 +286,12 @@ func Test_MyGet(t *testing.T) {
 func Test_pebble_wa(t *testing.T) {
 	path := "ww/pebble"
 	db := MustDB(path, true, EnablePebble, func(options *Options) *Options {
-		options.FS = vfs.Default
+		//options.FS = vfs.Default
 		options.DisableAutomaticCompactions = false
 
-		options.FileFormat = sstable.TableFormatLevelDB
-		pagesize := 4 << 10                             // 4KB
-		options.CacheSize = int64(1024 * 16 * pagesize) //
+		options.FileFormat = sstable.TableFormatRocksDBv2
+		pagesize := 4 << 10                        // 4KB
+		options.CacheSize = int64(1024 * pagesize) //
 		options.MaxConcurrentCompactions = func() int { return 8 }
 		return options
 	})
@@ -308,16 +308,18 @@ func Test_pebble_wa(t *testing.T) {
 	for i := 0; i < times; i++ {
 		keys := datas[i<<20 : (i+1)<<20]
 		batchWrite(db, keys, uint64(i))
-		println(fmt.Sprintf("done %d", i))
+		println(fmt.Sprintf("multilevelflush done round%d", i))
 	}
-	println(fmt.Sprintf("写入阶段耗时(ms): %d", time.Since(writeStart).Milliseconds()))
+	writeTime := time.Since(writeStart).Milliseconds()
 
 	compactWaitStart := time.Now()
 	for isCompacting(db) {
 		println("wait for compact")
 		time.Sleep(500 * time.Millisecond)
 	}
-	println(fmt.Sprintf("等待压实耗时(ms): %d", time.Since(compactWaitStart).Milliseconds()))
+	compactTime := time.Since(compactWaitStart).Milliseconds()
+	totalWrite, totalTableCount := TotalWrite(db)
+	println(fmt.Sprintf("w=%dMB \t tables=%d \t time=%dms", totalWrite, totalTableCount, writeTime+compactTime))
 
 	benchmarkRandomReadMultiThread(datas, db, 1)
 	benchmarkRandomReadMultiThread(datas, db, 4)
@@ -328,11 +330,6 @@ func Test_pebble_wa(t *testing.T) {
 	benchmarkRandomReadMultiThread(datas, db, 32)
 	benchmarkRandomReadMultiThread(datas, db, 48)
 	benchmarkRandomReadMultiThread(datas, db, 64)
-
-	metrics := stat(db)
-	use(metrics)
-	use(pmtinternal.PartIdx)
-	println(fmt.Sprintf("total bytes in: %d", metrics.Total().BytesIn))
 
 	// 512page
 	//start random read benchmark, concurrency=1
@@ -403,7 +400,7 @@ func Test_pebble_r(t *testing.T) {
 
 		options.FileFormat = sstable.TableFormatLevelDB
 		pagesize := 4 << 10 // 4KB
-		options.CacheSize = int64(4096 * 16 * 16 * pagesize)
+		options.CacheSize = int64(1024 * pagesize)
 		options.MaxConcurrentCompactions = func() int { return 8 }
 
 		options.ReadOnly = true // important
@@ -435,8 +432,8 @@ func Test_pebble_r(t *testing.T) {
 // 128, 写耗时: 195638,269629,312484,276104,225041=>596.42 Kops
 func Test_pmt_wa(t *testing.T) {
 	path := "ww/pmt"
-	db := MustDB(path, false, func(options *Options) *Options {
-		//options.FS = vfs.Default
+	db := MustDB(path, true, func(options *Options) *Options {
+		options.FS = vfs.Default
 
 		pmtinternal.SetStep1Method(pmtinternal.PlanStep1V4)
 		pmtinternal.EnablePMTTableFormat = true
@@ -453,7 +450,7 @@ func Test_pmt_wa(t *testing.T) {
 	defer dumpFlushHistory(0, path)
 
 	const flushConcurrency = 1
-	times := 128 // 128
+	times := 32 // 128
 	datas := make([]uint64, 0, times<<20)
 	for i := 0; i < times; i++ {
 		path := filepath.Join(datasetPath, fmt.Sprintf("normal_plus_round_%03d.bin", i)) // normal_plus_round_%03d or uniform_round_%03d
@@ -468,12 +465,13 @@ func Test_pmt_wa(t *testing.T) {
 		pmtinternal.PartIdx = newPartIdxFrom(flushPlan.planList) // TODO: 不通过CompactionEnd/FlushEnd更新PartIdx
 		println(fmt.Sprintf("multilevelflush done round%d", i))
 	}
+	writeTime := time.Since(writeStart).Milliseconds()
+	totalWrite, totalTableCount := TotalWrite(db)
+	println(fmt.Sprintf("w=%dMB \t tables=%d \t time=%dms", totalWrite, totalTableCount, writeTime))
 
-	println(fmt.Sprintf("写入阶段耗时(ms): %d", time.Since(writeStart).Milliseconds()))
-
-	metrics := stat(db)
-	use(metrics)
-	printPartStat()
+	//metrics := stat(db)
+	//use(metrics)
+	printPMTStat()
 	printTotalWriteExpectedList()
 	// ------------------------------
 	//benchmarkRandomReadMultiThread(datas, db, 1)
@@ -484,11 +482,11 @@ func Test_pmt_wa(t *testing.T) {
 	//benchmarkRandomReadMultiThread(datas, db, 24)
 	//benchmarkRandomReadMultiThread(datas, db, 32)
 	//benchmarkRandomReadMultiThread(datas, db, 48)
-	benchmarkRandomReadMultiThread(datas, db, 64)
+	//benchmarkRandomReadMultiThread(datas, db, 64)
 	println(fmt.Sprintf("avgMissProbeCount=%.4f", db.PMTAverageMissProbeCount(datas)))
 }
 
-func printPartStat() {
+func printPMTStat() {
 	const (
 		smallFileThreshold = uint64(4 * PageSize)
 		smallPartThreshold = uint64(512 * PageSize)
@@ -522,8 +520,18 @@ func printPartStat() {
 			largePartCount++
 		}
 	}
-	println(fmt.Sprintf("collectorKVCount=%d", len(collectorSnapshot().Keys)))
+	println(fmt.Sprintf("collectorKVCount=%d", len(CurrCollector.Keys)))
 	println(fmt.Sprintf("partCount=%d, smallPartCount=%d, largePartCount=%d, fileCount=%d, smallFileCount=%d", partCount, smallPartCount, largePartCount, fileCount, smallFileCount))
+}
+
+func TotalWrite(d *DB) (totalWrite int, totalTableCount int) {
+	m := d.Metrics()
+	for level := 0; level < numLevels; level++ {
+		l := &m.Levels[level]
+		totalWrite += int(l.BytesFlushed+l.BytesCompacted) >> 20
+		totalTableCount += int(l.TablesFlushed + l.TablesCompacted)
+	}
+	return
 }
 
 // normal_plus, 128,
@@ -631,33 +639,35 @@ func benchmarkRandomRead(datas []uint64, db *DB) {
 	println(fmt.Sprintf("random read cost %dms", time.Since(start).Milliseconds()))
 }
 
-func benchmarkRandomReadMultiThread(datas []uint64, db *DB, concurrency int) {
+func benchmarkRandomReadMultiThread(data []uint64, db *DB, concurrency int) {
+	const readN = 1 << 20
 	if concurrency < 1 {
 		panic("concurrency < 1")
 	}
-	startMetrics := db.Metrics()
-	startBlockHits := startMetrics.BlockCache.Hits
-	startBlockMisses := startMetrics.BlockCache.Misses
-
-	readN := 1 << 20
-	rand.Shuffle(len(datas), func(i, j int) {
-		datas[i], datas[j] = datas[j], datas[i]
+	if concurrency > readN {
+		panic("concurrency > readN")
+	}
+	if readN > len(data) {
+		panic(`readN > len(data)`)
+	}
+	rand.Shuffle(len(data), func(i, j int) {
+		data[i], data[j] = data[j], data[i]
 	})
-	start := time.Now()
+	startMetrics := db.Metrics()
 	var wg sync.WaitGroup
 	var totalFilesAccessed atomic.Int64
 	var totalReads atomic.Int64
+	startBlockHits := startMetrics.BlockCache.Hits
+	startBlockMisses := startMetrics.BlockCache.Misses
 	chunk := (readN + concurrency - 1) / concurrency
+	start := time.Now()
 	for g := 0; g < concurrency; g++ {
 		begin := g * chunk
 		end := begin + chunk
 		if end > readN {
 			end = readN
 		}
-		if begin >= end {
-			continue
-		}
-		keys := datas[begin:end]
+		keys := data[begin:end]
 		wg.Add(1)
 		go func(keys []uint64) {
 			defer wg.Done()

@@ -302,7 +302,7 @@ func MustDB(path string, clear bool, list ...OptionPatch) *DB {
 		opts = e(opts)
 	}
 	if opts.FS != vfs.Default && clear {
-		panic("不是vfs.Default你删除什么?")
+		println("===============删除数据库并以内存启动=================")
 	}
 	if opts.FS == vfs.Default && !clear {
 		println("===============非空数据库=================")

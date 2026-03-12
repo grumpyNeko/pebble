@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
-	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -16,37 +16,48 @@ import (
 	"github.com/cockroachdb/pebble/vfs"
 )
 
-func Test_TableFormat_RandomPointLookupCompare1M(t *testing.T) {
+func Test_TableFormat(t *testing.T) {
 	const (
-		writtenValue = uint64(7)
-		queryCount   = 1 << 20
+		queryCount = 1 << 20
 	)
 
-	d := LoadDataFile(filepath.Join(datasetPath, "normal_plus_round_000.bin"))
 	maxEntries := pmtformat.MaxEntriesPerTable()
-	keys := d.Keys
-	if len(keys) > maxEntries {
-		keys = keys[:maxEntries]
+	rng := rand.New(rand.NewSource(20260306))
+	keySet := make(map[uint64]struct{}, maxEntries)
+	keys := make([]uint64, 0, maxEntries)
+	for len(keys) < maxEntries {
+		k := uint64(rng.Uint32())
+		if _, ok := keySet[k]; ok {
+			continue
+		}
+		keySet[k] = struct{}{}
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+
+	vals := make([]uint64, len(keys))
+	for i := range vals {
+		vals[i] = rng.Uint64()
 	}
 
-	rng := rand.New(rand.NewSource(20260306))
 	queries := make([]uint64, queryCount)
 	for i := range queries {
 		queries[i] = keys[rng.Intn(len(keys))]
 	}
-
 	var warmupN = 1 << 14
 	if warmupN > len(queries) {
 		warmupN = len(queries)
 	}
 
-	levelElapsed := measureRandomPointLookupLevelDB(t, keys, writtenValue, queries, warmupN)
-	pmtElapsed := measureRandomPointLookupPMT(t, keys, writtenValue, queries, warmupN)
+	levelElapsed := measureRandomPointLookupLevelDB(
+		t, keys, vals, queries, warmupN, SnappyCompression, 16,
+	)
+	pmtElapsed := measureRandomPointLookupPMT(t, keys, vals, queries, warmupN)
 
 	levelNSPerOp := float64(levelElapsed.Nanoseconds()) / float64(queryCount)
 	pmtNSPerOp := float64(pmtElapsed.Nanoseconds()) / float64(queryCount)
 	t.Logf(
-		"entries=%d(from 1M), queries=%d, leveldb=%s(%.1f ns/op), pmt=%s(%.1f ns/op), pmt/leveldb=%.3f",
+		"entries=%d, queries=%d, leveldb=%s(%.1f ns/op), pmt=%s(%.1f ns/op), pmt/leveldb=%.3f",
 		len(keys), queryCount,
 		levelElapsed, levelNSPerOp,
 		pmtElapsed, pmtNSPerOp,
@@ -71,7 +82,13 @@ func runRandomPointLookups(iter base.InternalIterator, queries []uint64) time.Du
 }
 
 func measureRandomPointLookupLevelDB(
-	t *testing.T, keys []uint64, writtenValue uint64, queries []uint64, warmupN int,
+	t *testing.T,
+	keys []uint64,
+	vals []uint64,
+	queries []uint64,
+	warmupN int,
+	compression Compression,
+	blockRestartInterval int,
 ) time.Duration {
 	t.Helper()
 
@@ -83,17 +100,23 @@ func measureRandomPointLookupLevelDB(
 	}
 
 	w := sstable.NewRawWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
-		TableFormat: sstable.TableFormatLevelDB,
+		TableFormat:          sstable.TableFormatLevelDB,
+		Compression:          compression,
+		BlockRestartInterval: blockRestartInterval,
 	})
-	valueBuf := BigEndian(writtenValue)
-	for _, k := range keys {
-		if err := w.Add(base.MakeInternalKey(BigEndian(k), 0, base.InternalKeyKindSet), valueBuf, false /* forceObsolete */); err != nil {
+	for i, k := range keys {
+		if err := w.Add(base.MakeInternalKey(BigEndian(k), 0, base.InternalKeyKindSet), BigEndian(vals[i]), false /* forceObsolete */); err != nil {
 			t.Fatalf("writer.Add failed (leveldb key=%d): %v", k, err)
 		}
 	}
 	if err := w.Close(); err != nil {
 		t.Fatalf("writer.Close failed (leveldb): %v", err)
 	}
+	levelInfo, err := mem.Stat(filename)
+	if err != nil {
+		t.Fatalf("stat leveldb sstable failed: %v", err)
+	}
+	t.Logf("leveldb file size=%d bytes", levelInfo.Size())
 
 	rf, err := mem.Open(filename)
 	if err != nil {
@@ -125,7 +148,7 @@ func measureRandomPointLookupLevelDB(
 }
 
 func measureRandomPointLookupPMT(
-	t *testing.T, keys []uint64, writtenValue uint64, queries []uint64, warmupN int,
+	t *testing.T, keys []uint64, vals []uint64, queries []uint64, warmupN int,
 ) time.Duration {
 	t.Helper()
 
@@ -139,15 +162,19 @@ func measureRandomPointLookupPMT(
 	w := sstable.NewRawWriter(objstorageprovider.NewFileWritable(f), sstable.WriterOptions{
 		TableFormat: sstable.TableFormatPMT0,
 	})
-	valueBuf := BigEndian(writtenValue)
-	for _, k := range keys {
-		if err := w.Add(base.MakeInternalKey(BigEndian(k), 0, base.InternalKeyKindSet), valueBuf, false /* forceObsolete */); err != nil {
+	for i, k := range keys {
+		if err := w.Add(base.MakeInternalKey(BigEndian(k), 1, base.InternalKeyKindSet), BigEndian(vals[i]), false /* forceObsolete */); err != nil {
 			t.Fatalf("writer.Add failed (pmt key=%d): %v", k, err)
 		}
 	}
 	if err := w.Close(); err != nil {
 		t.Fatalf("writer.Close failed (pmt): %v", err)
 	}
+	pmtInfo, err := mem.Stat(filename)
+	if err != nil {
+		t.Fatalf("stat pmt sstable failed: %v", err)
+	}
+	t.Logf("pmt file size=%d bytes", pmtInfo.Size())
 
 	rf, err := mem.Open(filename)
 	if err != nil {
