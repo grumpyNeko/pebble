@@ -23,7 +23,6 @@ import (
 	"slices"
 	"sort"
 	"sync"
-	"time"
 )
 
 var (
@@ -85,7 +84,7 @@ func batchWrite(db *DB, keys []uint64, v uint64) {
 	//		}
 	//	}
 	//}
-	time.Sleep(500 * time.Millisecond)
+	//time.Sleep(500 * time.Millisecond)
 	if db.mu.nextJobID != startJobId+1 {
 		println(`db.mu.nextJobID != startJobId+1`)
 	}
@@ -113,7 +112,6 @@ func pmtOptions() *Options {
 				println(fmt.Sprintf("WriteStallEnd"))
 			},
 		},
-		L0StopWritesThreshold: 1024,
 	}
 	opts.Experimental.MultiLevelCompactionHeuristic = NoMultiLevel{}
 	opts.Experimental.EnableColumnarBlocks = func() bool {
@@ -139,7 +137,8 @@ func pmtOptions() *Options {
 			 c.startLevel.files.Len() == 1
 		   要求L0只有一个文件, 有点蠢
 	*/
-	opts.L0CompactionThreshold = 5
+	opts.L0CompactionThreshold = 4
+	opts.L0StopWritesThreshold = 5
 	opts.MaxConcurrentCompactions = func() int { return 8 }
 	const pagesize = 4096
 	opts.CacheSize = 256 * pagesize
@@ -161,6 +160,8 @@ func EnablePebble(opts *Options) *Options {
 	opts.DisableAutomaticCompactions = false
 	opts.FileFormat = sstable.TableFormatLevelDB
 	opts.Experimental.MultiLevelCompactionHeuristic = NoMultiLevel{}
+
+	opts.L0StopWritesThreshold = 5
 	return opts
 }
 
@@ -324,7 +325,7 @@ func MustDB(path string, clear bool, list ...OptionPatch) *DB {
 
 	if pmtinternal.EnablePMT {
 		if !pmtinternal.EnablePMTTableFormat {
-			println("EnablePMT but not EnablePMTTableFormat????????????????????????????")
+			println("======================EnablePMT but not EnablePMTTableFormat=================================")
 		}
 	}
 	return db

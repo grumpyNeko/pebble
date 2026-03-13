@@ -285,13 +285,14 @@ func Test_MyGet(t *testing.T) {
 // 128,
 func Test_pebble_wa(t *testing.T) {
 	path := "ww/pebble"
+	dataset := "uniform" // normal_plus or uniform
 	db := MustDB(path, true, EnablePebble, func(options *Options) *Options {
-		//options.FS = vfs.Default
+		options.FS = vfs.Default
 		options.DisableAutomaticCompactions = false
 
 		options.FileFormat = sstable.TableFormatLevelDB
-		pagesize := 4 << 10                        // 4KB
-		options.CacheSize = int64(1024 * pagesize) //
+		pagesize := 4 << 10                            // 4KB
+		options.CacheSize = int64(1024 * 4 * pagesize) //
 		options.MaxConcurrentCompactions = func() int { return 8 }
 		return options
 	})
@@ -299,7 +300,7 @@ func Test_pebble_wa(t *testing.T) {
 	times := 128 // 48
 	datas := make([]uint64, 0, times<<20)
 	for i := 0; i < times; i++ {
-		path := filepath.Join(datasetPath, fmt.Sprintf("normal_plus_round_%03d.bin", i)) // normal_plus_round_%03d or uniform_round_%03d
+		path := filepath.Join(datasetPath, fmt.Sprintf("%s_round_%03d.bin", dataset, i))
 		d := LoadDataFile(path)
 		datas = append(datas, d.Keys...)
 	}
@@ -432,17 +433,17 @@ func Test_pebble_r(t *testing.T) {
 // 128, 写耗时: 195638,269629,312484,276104,225041=>596.42 Kops
 func Test_pmt_wa(t *testing.T) {
 	path := "ww/pmt"
-	dataset := "normal_plus" // normal_plus_round_%03d or uniform_round_%03d
+	dataset := "uniform" // normal_plus or uniform
 	db := MustDB(path, true, func(options *Options) *Options {
-		options.FS = vfs.Default
+		//options.FS = vfs.Default
 
 		pmtinternal.SetStep1Method(pmtinternal.PlanStep1V4)
-		//pmtinternal.EnablePMTTableFormat = true
-		//options.FileFormat = sstable.TableFormatPMT0
-		options.FileFormat = sstable.TableFormatLevelDB
+		pmtinternal.EnablePMTTableFormat = true
+		options.FileFormat = sstable.TableFormatPMT0
+		//options.FileFormat = sstable.TableFormatLevelDB
 
-		pagesize := 4 << 10                             // 4KB
-		options.CacheSize = int64(1024 * 16 * pagesize) //
+		pagesize := 4 << 10
+		options.CacheSize = int64(1024 * pagesize) //
 		options.DisableAutomaticCompactions = true
 		options.MaxConcurrentCompactions = func() int { return 8 }
 		return options

@@ -6,8 +6,8 @@ import (
 
 var EnablePMT = true
 var EnablePMTTableFormat = false
-var EnableCollector = true
-var CollectorTriggerPages = 3
+var EnableCollector = false
+var CollectorTriggerPages = 0
 var CollectorMaxBytes uint64 = 64 << 20
 
 const PMTPartIdxFilename = "PartIdx.json"
@@ -22,7 +22,7 @@ const (
 
 var Step1Method = PlanStep1V4
 var Step1V4RewriteFactor = 1.0
-var Step1V4NewWeight = 0.9
+var Step1V4NewWeight = 1.0
 var Step1V4OldWeight = 0.1
 
 // If totalWriteExpected is smaller than this threshold,
