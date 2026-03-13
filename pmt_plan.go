@@ -1,6 +1,7 @@
 package pebble
 
 import (
+	"encoding/json"
 	"fmt"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/manifest"
@@ -39,7 +40,6 @@ type FlushPlanStat struct {
 }
 
 var flushHistory []FlushPlanStat
-var totalWriteExpectedList []uint64
 
 type FlushPlan struct {
 	passiveMergeCount  int
@@ -85,7 +85,7 @@ func plan(newKeys []uint64) FlushPlan {
 }
 
 func step1Simple() FlushPlan {
-	const threshold = 3
+	const threshold = 5
 
 	pList := make([]PartPlan, 0, 256)
 	var totalWriteExpected uint64
@@ -230,7 +230,7 @@ func snapshotPartPlanStats(planList []PartPlan) []PartPlanStat {
 
 func costV4(stack []base.FileNum, newPages int, writeTo int) float64 {
 	const (
-		C = 5
+		C = 4
 		B = 50
 	)
 	tablePages := stackPagesFromFiles(stack)
@@ -308,7 +308,6 @@ func sstSizeInPages(size uint64) uint64 {
 }
 
 func recordFlushPlan(flushPlan FlushPlan) {
-	totalWriteExpectedList = append(totalWriteExpectedList, flushPlan.totalWriteExpected)
 	wt0 := append([]int(nil), flushPlan.wt0...)
 	flushHistory = append(flushHistory, FlushPlanStat{
 		passiveMergeCount:  flushPlan.passiveMergeCount,
@@ -403,23 +402,31 @@ func extraWriteExpected(pp PartPlan) uint64 {
 }
 
 func chooseTryPushIdx(flushPlan FlushPlan, wt0Idx int) (int, uint64, bool) {
-	prevIdx, hasPrev := wt0Idx-1, wt0Idx > 0
-	succIdx, hasSucc := wt0Idx+1, wt0Idx+1 < len(flushPlan.planList)
-	if !hasPrev && !hasSucc {
+	bestIdx := -1
+	bestWrite := uint64(^uint64(0))
+	tryUpdate := func(idx int) {
+		if idx < 0 || idx >= len(flushPlan.planList) {
+			return
+		}
+		pp := flushPlan.planList[idx]
+		if pp.WriteTo == 0 {
+			if idx < wt0Idx {
+				panic("chooseTryPushIdx: prev in wt0")
+			}
+			panic("chooseTryPushIdx: succ in wt0")
+		}
+		extraWrite := extraWriteExpected(pp)
+		if extraWrite < bestWrite {
+			bestIdx = idx
+			bestWrite = extraWrite
+		}
+	}
+	tryUpdate(wt0Idx - 1)
+	tryUpdate(wt0Idx + 1)
+	if bestIdx == -1 {
 		return 0, 0, false
 	}
-	if !hasPrev {
-		return succIdx, extraWriteExpected(flushPlan.planList[succIdx]), true
-	}
-	if !hasSucc {
-		return prevIdx, extraWriteExpected(flushPlan.planList[prevIdx]), true
-	}
-	prevWrite := extraWriteExpected(flushPlan.planList[prevIdx])
-	succWrite := extraWriteExpected(flushPlan.planList[succIdx])
-	if prevWrite < succWrite {
-		return prevIdx, prevWrite, true
-	}
-	return succIdx, succWrite, true
+	return bestIdx, bestWrite, true
 }
 
 func activeMergePlan(flushPlan FlushPlan, extraWriteThreshold uint64) FlushPlan {
@@ -534,24 +541,45 @@ func dumpFlushHistory(startFrom int, path string) {
 }
 
 func printTotalWriteExpectedList() {
-	var b strings.Builder
-	b.WriteString("totalWriteExpectedList=[")
+	totalWriteExpectedList := make([]uint64, 0, len(flushHistory))
 	var sum uint64
-	for i, v := range totalWriteExpectedList {
-		if i > 0 {
-			b.WriteString(",")
-		}
-		b.WriteString(fmt.Sprintf("%d", v))
+	for _, h := range flushHistory {
+		v := h.totalWriteExpected
+		totalWriteExpectedList = append(totalWriteExpectedList, v)
 		sum += v
 	}
-	b.WriteString("]")
-	println(b.String())
+	js, err := json.Marshal(totalWriteExpectedList)
+	if err != nil {
+		panic("marshal failed")
+	}
+	println("totalWriteExpectedList=" + string(js))
 	if len(totalWriteExpectedList) == 0 {
 		println("avgTotalWrite=0")
 		return
 	}
 	avg := float64(sum) / float64(len(totalWriteExpectedList))
 	println(fmt.Sprintf("avgTotalWrite=%.2f", avg))
+}
+
+func printActiveMergeCountList() {
+	activeMergeCountList := make([]int, 0, len(flushHistory))
+	var sum int
+	for _, h := range flushHistory {
+		v := h.activeMergeCount
+		activeMergeCountList = append(activeMergeCountList, v)
+		sum += v
+	}
+	js, err := json.Marshal(activeMergeCountList)
+	if err != nil {
+		panic("marshal failed")
+	}
+	println("activeMergeCountList=" + string(js))
+	if len(activeMergeCountList) == 0 {
+		println("avgActiveMergeCount=0")
+		return
+	}
+	avg := float64(sum) / float64(len(activeMergeCountList))
+	println(fmt.Sprintf("avgActiveMergeCount=%.2f", avg))
 }
 
 // [1000,500,155,100]

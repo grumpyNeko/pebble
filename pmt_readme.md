@@ -216,11 +216,11 @@ activeMergePlan(flushplan) {
 	return flushplan
 }
 
-// 推迟压实, 减少写入峰值
+// 新数据少就推迟压实, 减少写入峰值
 delay(flushPlan) FlushPlan {
 	for idx in flushPlan.wt0 
 		pp = flushPlan.planList[idx]
-		continue if pp.NewPages >= pmtinternal.DelayCompactNewPagesThreshold 
+		continue if pp.NewPages >= DelayCompactNewPagesThreshold 
 		remove idx from flushPlan.wt0 
 		pp.WriteTo = newWriteTo
 		reducedWrite = ..
@@ -231,9 +231,25 @@ delay(flushPlan) FlushPlan {
 	flushPlan.wt0 = collectWt0(flushPlan.planList)
 	return flushPlan
 }
+
+chooseTryPushIdx(flushPlan, wt0Idx) (int, uint64) {
+	bestIdx = -1
+	bestWrite = maxuint64
+	tryUpdate = (idx int){
+		return if idx < 0 || idx >= len(flushPlan.planList) 
+		extraWrite = extraWriteExpected(flushPlan.planList[idx])
+		if extraWrite < bestWrite 
+			bestIdx = idx
+			bestWrite = extraWrite
+
+	tryUpdate(wt0Idx - 1)
+	tryUpdate(wt0Idx + 1)
+
+	return bestIdx, bestWrite
+}
 ```
-TODO
-提前压实, 但是prev和succ哪个更适合改为writeTo=0?
+
+提前压实, prev和succ哪个更适合改为writeTo=0?
 activeMergePlan, totalExtraWrite, ..很多名字不太好, 统计方式也次优
 wt0改成map, 不要多次collectWt0而是随时维护wt0
 

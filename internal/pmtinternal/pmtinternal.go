@@ -6,7 +6,7 @@ import (
 )
 
 var EnablePMT = true
-var EnablePMTTableFormat = false
+var EnablePMTTableFormat = true
 var LogicDel = false
 var EnableCollector = false
 var CollectorTriggerPages = 0
