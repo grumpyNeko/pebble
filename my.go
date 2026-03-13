@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -1174,7 +1175,7 @@ func multilevelFlush(db *DB, mem fakeMemTable, files []base.FileNum, outputLevel
 	keys := mem.keys
 	v := mem.v
 	if len(keys) == 0 && len(files) == 0 {
-		println("nothing to do")
+		// println("multilevelFlush nothing to do")
 		return -1
 	}
 	// 用于研究concurrent multi flush
@@ -1288,6 +1289,9 @@ func multilevelFlush(db *DB, mem fakeMemTable, files []base.FileNum, outputLevel
 
 	db.compact(comp, c.done)
 	if err := <-c.done; err != nil {
+		if strings.Contains(err.Error(), "output table has no keys") {
+			return -1
+		}
 		panic(err)
 	}
 

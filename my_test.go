@@ -433,7 +433,9 @@ func Test_pebble_r(t *testing.T) {
 // 128, 写耗时: 195638,269629,312484,276104,225041=>596.42 Kops
 func Test_pmt_wa(t *testing.T) {
 	path := "ww/pmt"
-	dataset := "uniform" // normal_plus or uniform
+	dataset := "normal_plus" // normal_plus or uniform
+	pmtinternal.EnableCollector = true
+	pmtinternal.CollectorTriggerPages = 3
 	db := MustDB(path, true, func(options *Options) *Options {
 		//options.FS = vfs.Default
 
@@ -473,7 +475,7 @@ func Test_pmt_wa(t *testing.T) {
 
 	//metrics := stat(db)
 	//use(metrics)
-	printPMTStat()
+	stat0 := printPMTStat()
 	printTotalWriteExpectedList()
 	// ------------------------------
 	benchmarkRandomReadMultiThread(datas, db, 1)
@@ -486,9 +488,37 @@ func Test_pmt_wa(t *testing.T) {
 	benchmarkRandomReadMultiThread(datas, db, 48)
 	benchmarkRandomReadMultiThread(datas, db, 64)
 	println(fmt.Sprintf("avgMissProbeCount=%.4f", db.PMTAverageMissProbeCount(datas)))
+
+	// 测试v=999删除
+	delKeys := append([]uint64(nil), datas...)
+	rand.Shuffle(len(delKeys), func(i, j int) {
+		delKeys[i], delKeys[j] = delKeys[j], delKeys[i]
+	})
+	delKeys = delKeys[:len(delKeys)/2]
+	pmtinternal.LogicDel = true
+	for i := 0; i < times/2; i++ {
+		keys := delKeys[i<<20 : (i+1)<<20]
+		flushPlan := plan(keys)
+		multilevelFlushConcurrent(db, keys, uint64(999), flushPlan.planList, flushConcurrency)
+		pmtinternal.PartIdx = newPartIdxFrom(flushPlan.planList) // TODO: 不通过CompactionEnd/FlushEnd更新PartIdx
+	}
+	stat1 := printPMTStat()
+	println(stat0)
+	println(stat1)
+	benchmarkRandomReadMultiThread(datas, db, 16)
+	println(fmt.Sprintf("avgMissProbeCount=%.4f", db.PMTAverageMissProbeCount(datas)))
 }
 
-func printPMTStat() {
+func Test_pmt_del(t *testing.T) {
+	//
+	// db = ..
+	// datas = ..
+	//
+}
+
+// ================================================================
+
+func printPMTStat() string {
 	const (
 		smallFileThreshold = uint64(4 * PageSize)
 		smallPartThreshold = uint64(512 * PageSize)
@@ -522,8 +552,10 @@ func printPMTStat() {
 			largePartCount++
 		}
 	}
-	println(fmt.Sprintf("collectorKVCount=%d", len(CurrCollector.Keys)))
-	println(fmt.Sprintf("partCount=%d, smallPartCount=%d, largePartCount=%d, fileCount=%d, smallFileCount=%d", partCount, smallPartCount, largePartCount, fileCount, smallFileCount))
+	ret := fmt.Sprintf("collectorKVCount=%d", len(CurrCollector.Keys))
+	ret += "\n"
+	ret += fmt.Sprintf("partCount=%d, smallPartCount=%d, largePartCount=%d, fileCount=%d, smallFileCount=%d", partCount, smallPartCount, largePartCount, fileCount, smallFileCount)
+	return ret
 }
 
 func TotalWrite(d *DB) (totalWrite int, totalTableCount int) {

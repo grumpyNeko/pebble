@@ -222,6 +222,9 @@ func (r *Runner) writeKeysToTable(tw sstable.RawWriter) (splitKey []byte, _ erro
 		if err != nil {
 			return nil, err
 		}
+		if pmtinternal.EnablePMT && pmtinternal.LogicDel && pmtinternal.IsLogicDelValue(v) {
+			continue
+		}
 		if err := tw.Add(kv.K, v, r.iter.ForceObsoleteDueToRangeDel()); err != nil {
 			return nil, err
 		}

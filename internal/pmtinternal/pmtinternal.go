@@ -1,14 +1,16 @@
 package pmtinternal
 
 import (
+	"encoding/binary"
 	"fmt"
 )
 
 var EnablePMT = true
 var EnablePMTTableFormat = false
+var LogicDel = false
 var EnableCollector = false
 var CollectorTriggerPages = 0
-var CollectorMaxBytes uint64 = 64 << 20
+var CollectorMaxBytes uint64 = 16 << 20
 
 const PMTPartIdxFilename = "PartIdx.json"
 const PMTFlushHistoryDirname = "flush_history"
@@ -45,4 +47,8 @@ func SetStep1Method(m PlanStep1Method) {
 	default:
 		panic(fmt.Sprintf("SetStep1Method: unknown method %d", m))
 	}
+}
+
+func IsLogicDelValue(v []byte) bool {
+	return len(v) == 8 && binary.BigEndian.Uint64(v) == 999
 }
