@@ -286,7 +286,10 @@ func Test_MyGet(t *testing.T) {
 func Test_pebble_wa(t *testing.T) {
 	path := "ww/pebble"
 	dataset := "normal_plus" // normal_plus or uniform
-	rounds := 128            // 48
+	rounds := 32
+	checkpoints := []int{8, 16, 24, 32}
+	randomReadConcurrency := []int{8, 16, 24, 32}
+	reportPath := filepath.Join("ww", fmt.Sprintf("Test_pebble_wa_%s.log", time.Now().Format("02150405")))
 
 	db := MustDB(path, true, EnablePebble, func(options *Options) *Options {
 		options.FS = vfs.Default
@@ -306,37 +309,51 @@ func Test_pebble_wa(t *testing.T) {
 		keys = append(keys, d.Keys...)
 	}
 
-	writeStart := time.Now()
-	for i := 0; i < rounds; i++ {
-		keys := keys[i<<20 : (i+1)<<20]
-		batchWrite(db, keys, uint64(i))
-		println(fmt.Sprintf("multilevelflush done round%d", i))
-	}
-	writeTime := time.Since(writeStart).Milliseconds()
+	var report strings.Builder
+	report.WriteString(fmt.Sprintf("dataset=%s\n\n", dataset))
 
-	compactWaitStart := time.Now()
-	for isCompacting(db) {
-		print(".")
-		time.Sleep(500 * time.Millisecond)
+	checkpointIdx := 0
+	checkPointWriteStart := time.Now()
+	for i := 0; i < rounds; i++ {
+		roundKeys := keys[i<<20 : (i+1)<<20]
+		batchWrite(db, roundKeys, uint64(i))
+		println(fmt.Sprintf("multilevelflush done round%d", i))
+		roundDone := i + 1
+		if checkpointIdx >= len(checkpoints) || roundDone != checkpoints[checkpointIdx] {
+			continue
+		}
+		pebbleCheckpoint(&report, db, keys[:roundDone<<20], roundDone, time.Since(checkPointWriteStart).Milliseconds(), randomReadConcurrency)
+		checkPointWriteStart = time.Now()
+		checkpointIdx++
 	}
-	compactTime := time.Since(compactWaitStart).Milliseconds()
-	pebbleStat(db, rounds, int(writeTime+compactTime))
-	// random read
-	//benchmarkRandomReadMultiThread(keys, db, 1)
-	//benchmarkRandomReadMultiThread(keys, db, 4)
-	//benchmarkRandomReadMultiThread(keys, db, 8)
-	//benchmarkRandomReadMultiThread(keys, db, 12)
-	//benchmarkRandomReadMultiThread(keys, db, 16)
-	//benchmarkRandomReadMultiThread(keys, db, 24)
-	//benchmarkRandomReadMultiThread(keys, db, 32)
-	//benchmarkRandomReadMultiThread(keys, db, 48)
-	benchmarkRandomReadMultiThread(keys, db, 64)
+	if err := os.WriteFile(reportPath, []byte(report.String()), 0644); err != nil {
+		panic("write pebble wa log")
+	}
 }
 
 func pebbleStat(db *DB, rounds int, ms int) string {
 	totalWrite, totalTableCount := TotalWrite(db)
 	wa := writeAmp(totalWrite, rounds, sstable.TableFormatLevelDB)
-	return fmt.Sprintf("w=%dMB \t wa=%.2f \t tables=%d \t time=%dms", totalWrite, wa, totalTableCount, ms)
+	return fmt.Sprintf("w=%dMB \t wa=%.2f \t tables=%d \t roundTime=%dms", totalWrite, wa, totalTableCount, ms)
+}
+
+func pebbleCheckpoint(
+	report *strings.Builder, db *DB, keys []uint64, rounds int, writeTime int64, randomReadConcurrency []int,
+) {
+	waitStart := time.Now()
+	for isCompacting(db) {
+		print(".")
+		time.Sleep(100 * time.Millisecond)
+	}
+	waitTime := time.Since(waitStart).Milliseconds()
+	roundStat := pebbleStat(db, rounds, int(writeTime+waitTime))
+	report.WriteString(fmt.Sprintf("%d, %s", rounds, roundStat))
+	report.WriteString("\n")
+	for _, concurrency := range randomReadConcurrency {
+		report.WriteString(benchmarkRandomReadMultiThreadStat(keys, db, concurrency))
+		report.WriteString("\n")
+	}
+	report.WriteString("\n")
 }
 
 func Test_pebble_r(t *testing.T) {
@@ -640,6 +657,10 @@ func benchmarkRandomRead(datas []uint64, db *DB) {
 }
 
 func benchmarkRandomReadMultiThread(data []uint64, db *DB, concurrency int) {
+	println(benchmarkRandomReadMultiThreadStat(data, db, concurrency))
+}
+
+func benchmarkRandomReadMultiThreadStat(data []uint64, db *DB, concurrency int) string {
 	const readN = 1 << 20
 	if concurrency < 1 {
 		panic("concurrency < 1")
@@ -686,10 +707,10 @@ func benchmarkRandomReadMultiThread(data []uint64, db *DB, concurrency int) {
 	endMetrics := db.Metrics()
 	deltaBlockHits := endMetrics.BlockCache.Hits - startBlockHits
 	deltaBlockMisses := endMetrics.BlockCache.Misses - startBlockMisses
-	println(fmt.Sprintf(
+	return fmt.Sprintf(
 		"randomread%d=%dms, avgFilesAccessed=%.4f, hits=%d, misses=%d, hitRate=%.2f%%",
 		concurrency, cost, avgFilesAccessed, deltaBlockHits, deltaBlockMisses, hitRate(deltaBlockHits, deltaBlockMisses),
-	))
+	)
 }
 
 func benchmarkRandomReadWithCPUProfile(t *testing.T, datas []uint64, db *DB, profPath string) {
