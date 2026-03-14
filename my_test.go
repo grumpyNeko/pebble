@@ -286,6 +286,8 @@ func Test_MyGet(t *testing.T) {
 func Test_pebble_wa(t *testing.T) {
 	path := "ww/pebble"
 	dataset := "normal_plus" // normal_plus or uniform
+	rounds := 128            // 48
+
 	db := MustDB(path, true, EnablePebble, func(options *Options) *Options {
 		options.FS = vfs.Default
 		options.DisableAutomaticCompactions = false
@@ -297,17 +299,16 @@ func Test_pebble_wa(t *testing.T) {
 		return options
 	})
 
-	times := 128 // 48
-	datas := make([]uint64, 0, times<<20)
-	for i := 0; i < times; i++ {
+	keys := make([]uint64, 0, rounds<<20)
+	for i := 0; i < rounds; i++ {
 		path := filepath.Join(datasetPath, fmt.Sprintf("%s_round_%03d.bin", dataset, i))
 		d := LoadDataFile(path)
-		datas = append(datas, d.Keys...)
+		keys = append(keys, d.Keys...)
 	}
 
 	writeStart := time.Now()
-	for i := 0; i < times; i++ {
-		keys := datas[i<<20 : (i+1)<<20]
+	for i := 0; i < rounds; i++ {
+		keys := keys[i<<20 : (i+1)<<20]
 		batchWrite(db, keys, uint64(i))
 		println(fmt.Sprintf("multilevelflush done round%d", i))
 	}
@@ -315,83 +316,27 @@ func Test_pebble_wa(t *testing.T) {
 
 	compactWaitStart := time.Now()
 	for isCompacting(db) {
-		println("wait for compact")
+		print(".")
 		time.Sleep(500 * time.Millisecond)
 	}
 	compactTime := time.Since(compactWaitStart).Milliseconds()
-	totalWrite, totalTableCount := TotalWrite(db)
-	wa := writeAmp(totalWrite, times, sstable.TableFormatLevelDB)
-	println(fmt.Sprintf("w=%dMB \t wa=%.2f \t tables=%d \t time=%dms", totalWrite, wa, totalTableCount, writeTime+compactTime))
+	pebbleStat(db, rounds, int(writeTime+compactTime))
 	// random read
-	//benchmarkRandomReadMultiThread(datas, db, 1)
-	//benchmarkRandomReadMultiThread(datas, db, 4)
-	//benchmarkRandomReadMultiThread(datas, db, 8)
-	//benchmarkRandomReadMultiThread(datas, db, 12)
-	//benchmarkRandomReadMultiThread(datas, db, 16)
-	//benchmarkRandomReadMultiThread(datas, db, 24)
-	//benchmarkRandomReadMultiThread(datas, db, 32)
-	//benchmarkRandomReadMultiThread(datas, db, 48)
-	benchmarkRandomReadMultiThread(datas, db, 64)
+	//benchmarkRandomReadMultiThread(keys, db, 1)
+	//benchmarkRandomReadMultiThread(keys, db, 4)
+	//benchmarkRandomReadMultiThread(keys, db, 8)
+	//benchmarkRandomReadMultiThread(keys, db, 12)
+	//benchmarkRandomReadMultiThread(keys, db, 16)
+	//benchmarkRandomReadMultiThread(keys, db, 24)
+	//benchmarkRandomReadMultiThread(keys, db, 32)
+	//benchmarkRandomReadMultiThread(keys, db, 48)
+	benchmarkRandomReadMultiThread(keys, db, 64)
+}
 
-	// 512page
-	//start random read benchmark, concurrency=1
-	//random read cost 110631ms
-	//start random read benchmark, concurrency=4
-	//random read cost 34848ms
-	//start random read benchmark, concurrency=8
-	//random read cost 25173ms
-	//start random read benchmark, concurrency=12
-	//random read cost 20969ms
-	//start random read benchmark, concurrency=16
-	//random read cost 15841ms
-	//start random read benchmark, concurrency=24
-	//random read cost 17974ms
-	//start random read benchmark, concurrency=32
-	//random read cost 19796ms
-	//start random read benchmark, concurrency=48
-	//random read cost 17226ms
-	//start random read benchmark, concurrency=64
-	//random read cost 17620ms
-
-	// 4096page
-	//start random read benchmark, concurrency=1
-	//random read cost 170569ms
-	//start random read benchmark, concurrency=4
-	//random read cost 39710ms
-	//start random read benchmark, concurrency=8
-	//random read cost 25718ms
-	//start random read benchmark, concurrency=12
-	//random read cost 21013ms
-	//start random read benchmark, concurrency=16
-	//random read cost 18012ms
-	//start random read benchmark, concurrency=24
-	//random read cost 17086ms
-	//start random read benchmark, concurrency=32
-	//random read cost 16808ms
-	//start random read benchmark, concurrency=48
-	//random read cost 16638ms
-	//start random read benchmark, concurrency=64
-	//random read cost 17269ms
-
-	// 4096page * 16 * 16
-	//start random read benchmark, concurrency=1
-	//random read cost 79698ms
-	//start random read benchmark, concurrency=4
-	//random read cost 21925ms
-	//start random read benchmark, concurrency=8
-	//random read cost 13801ms
-	//start random read benchmark, concurrency=12
-	//random read cost 10643ms
-	//start random read benchmark, concurrency=16
-	//random read cost 9957ms
-	//start random read benchmark, concurrency=24
-	//random read cost 9962ms
-	//start random read benchmark, concurrency=32
-	//random read cost 9098ms
-	//start random read benchmark, concurrency=48
-	//random read cost 9922ms
-	//start random read benchmark, concurrency=64
-	//random read cost 9062ms
+func pebbleStat(db *DB, rounds int, ms int) string {
+	totalWrite, totalTableCount := TotalWrite(db)
+	wa := writeAmp(totalWrite, rounds, sstable.TableFormatLevelDB)
+	return fmt.Sprintf("w=%dMB \t wa=%.2f \t tables=%d \t time=%dms", totalWrite, wa, totalTableCount, ms)
 }
 
 func Test_pebble_r(t *testing.T) {
