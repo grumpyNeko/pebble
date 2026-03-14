@@ -28,6 +28,397 @@ import (
 
 const datasetPath = "ww/dataset"
 
+// L0CompactionThreshold = 3, Normal+Uniform+MinMax, deviation=1 << 30
+// 128, 5.65 | 5.41,avg:3.829685 | 5.92
+
+// L0CompactionThreshold = 3, Normal+Uniform+MinMax, deviation=1 << 31
+// 32, 3.96,
+// 64,
+// 96,
+// 128, 5.66, avg:3.827046 |
+
+// L0CompactionThreshold = 3, Normal+Uniform+MinMax, deviation=1 << 32
+// 32, 3.99
+// 64, 4.53
+// 96, 5.05
+// 128, 5.45, avg:3.827048
+
+// L0CompactionThreshold = 3, Uniform
+// 32, 5.5, avg=3.624498
+// 64, 6.6, avg:3.756997
+// 96, 7.44, avg:3.801390
+// 128, 7.72, avg:3.84,
+
+// normal_plus
+// 64, 耗时: 91759+77551=169310=>396.37 Kops
+// 128,
+func Test_pebble_wa(t *testing.T) {
+	path := "ww/pebble"
+	dataset := "normal_plus" // normal_plus or uniform
+	rounds := 128
+	checkpoints := []int{8, 16, 24, 32}
+	randomReadConcurrency := []int{8, 16, 24, 32}
+	reportPath := filepath.Join("ww", fmt.Sprintf("Test_pebble_wa_%s.log", time.Now().Format("02150405")))
+
+	db := MustDB(path, true, EnablePebble, func(options *Options) *Options {
+		options.FS = vfs.Default
+		options.DisableAutomaticCompactions = false
+
+		options.FileFormat = sstable.TableFormatLevelDB
+		pagesize := 4 << 10                        // 4KB
+		options.CacheSize = int64(1024 * pagesize) //
+		options.MaxConcurrentCompactions = func() int { return 8 }
+		return options
+	})
+
+	keys := make([]uint64, 0, rounds<<20)
+	for i := 0; i < rounds; i++ {
+		path := filepath.Join(datasetPath, fmt.Sprintf("%s_round_%03d.bin", dataset, i))
+		d := LoadDataFile(path)
+		keys = append(keys, d.Keys...)
+	}
+
+	var report strings.Builder
+	report.WriteString(fmt.Sprintf("dataset=%s\n\n", dataset))
+
+	checkpointIdx := 0
+	checkPointWriteStart := time.Now()
+	var checkpointStats []pebbleCheckpointStat
+	for i := 0; i < rounds; i++ {
+		roundKeys := keys[i<<20 : (i+1)<<20]
+		batchWrite(db, roundKeys, uint64(i))
+		println(fmt.Sprintf("multilevelflush done round%d", i))
+		roundDone := i + 1
+		if checkpointIdx >= len(checkpoints) || roundDone != checkpoints[checkpointIdx] {
+			continue
+		}
+		checkpointStats = append(
+			checkpointStats,
+			pebbleCheckpoint(
+				db, keys[:roundDone<<20], roundDone, time.Since(checkPointWriteStart).Milliseconds(), randomReadConcurrency,
+			),
+		)
+		checkPointWriteStart = time.Now()
+		checkpointIdx++
+	}
+	report.WriteString(formatPebbleCheckpointStats(checkpointStats))
+	if err := os.WriteFile(reportPath, []byte(report.String()), 0644); err != nil {
+		panic("write pebble wa log")
+	}
+}
+
+type pebbleCheckpointStat struct {
+	rounds       int
+	writeTimeMS  int64
+	waitTimeMS   int64
+	totalWriteMB int
+	totalTables  int
+	randomReads  []string
+}
+
+func pebbleStat(totalWriteMB int, totalTableCount int, rounds int, ms int) string {
+	if rounds <= 0 {
+		panic("rounds <= 0")
+	}
+	wa := writeAmp(totalWriteMB, rounds, sstable.TableFormatLevelDB)
+	return fmt.Sprintf("w=%dMB \t wa=%.2f \t tables=%d \t roundTime=%dms \t kops=%.2f", totalWriteMB, wa, totalTableCount, ms, float64(rounds*(1<<20))/float64(ms)/1000)
+}
+
+func pebbleCheckpoint(db *DB, keys []uint64, rounds int, writeTime int64, randomReadConcurrency []int) pebbleCheckpointStat {
+	waitStart := time.Now()
+	for isCompacting(db) {
+		print(".")
+		time.Sleep(100 * time.Millisecond)
+	}
+	waitTime := time.Since(waitStart).Milliseconds()
+	totalWriteMB, totalTableCount := TotalWrite(db)
+	randomReads := make([]string, 0, len(randomReadConcurrency))
+	for _, concurrency := range randomReadConcurrency {
+		randomReads = append(randomReads, benchmarkRandomReadMultiThreadStat(keys, db, concurrency))
+	}
+	return pebbleCheckpointStat{
+		rounds:       rounds,
+		writeTimeMS:  writeTime,
+		waitTimeMS:   waitTime,
+		totalWriteMB: totalWriteMB,
+		totalTables:  totalTableCount,
+		randomReads:  randomReads,
+	}
+}
+
+func formatPebbleCheckpointStats(stats []pebbleCheckpointStat) string {
+	var report strings.Builder
+	prev := pebbleCheckpointStat{}
+	var totalTimeMS int64
+	for i, stat := range stats {
+		segmentTimeMS := stat.writeTimeMS + stat.waitTimeMS
+		totalTimeMS += segmentTimeMS
+		report.WriteString(fmt.Sprintf("%d\n", stat.rounds))
+		report.WriteString(fmt.Sprintf(
+			"total: %s\n",
+			pebbleStat(stat.totalWriteMB, stat.totalTables, stat.rounds, int(totalTimeMS)),
+		))
+		deltaRounds := stat.rounds
+		deltaTimeMS := segmentTimeMS
+		if i > 0 {
+			deltaRounds -= prev.rounds
+		}
+		report.WriteString(fmt.Sprintf(
+			"delta: %s\n",
+			pebbleStat(
+				stat.totalWriteMB-prev.totalWriteMB,
+				stat.totalTables-prev.totalTables,
+				deltaRounds,
+				int(deltaTimeMS),
+			),
+		))
+		report.WriteString("\n")
+		for _, line := range stat.randomReads {
+			report.WriteString(line)
+			report.WriteString("\n")
+		}
+		report.WriteString("\n")
+		prev = stat
+	}
+	return report.String()
+}
+
+func Test_pebble_r(t *testing.T) {
+	path := "ww/pebble"
+	db := MustDB(path, false, EnablePebble, func(options *Options) *Options {
+		options.FS = vfs.Default
+		options.DisableAutomaticCompactions = false
+
+		options.FileFormat = sstable.TableFormatLevelDB
+		pagesize := 4 << 10 // 4KB
+		options.CacheSize = int64(1024 * pagesize)
+		options.MaxConcurrentCompactions = func() int { return 8 }
+
+		options.ReadOnly = true // important
+		return options
+	})
+
+	times := 128 // 48
+	datas := make([]uint64, 0, times<<20)
+	for i := 0; i < times; i++ {
+		path := filepath.Join(datasetPath, fmt.Sprintf("normal_plus_round_%03d.bin", i))
+		d := LoadDataFile(path)
+		datas = append(datas, d.Keys...)
+	}
+
+	//avg(db)
+	benchmarkRandomReadMultiThread(datas, db, 1)
+	benchmarkRandomReadMultiThread(datas, db, 4)
+	benchmarkRandomReadMultiThread(datas, db, 8)
+	benchmarkRandomReadMultiThread(datas, db, 12)
+	benchmarkRandomReadMultiThread(datas, db, 16)
+	benchmarkRandomReadMultiThread(datas, db, 24)
+	benchmarkRandomReadMultiThread(datas, db, 32)
+	benchmarkRandomReadMultiThread(datas, db, 48)
+	benchmarkRandomReadMultiThread(datas, db, 64)
+}
+
+// normal_plus
+// 64, 写耗时: 84448,81142,97571=>687.79 Kops; 点读耗时=
+// 128, 写耗时: 195638,269629,312484,276104,225041=>596.42 Kops
+func Test_pmt_wa(t *testing.T) {
+	path := "ww/pmt"
+	dataset := "uniform" // normal_plus or uniform
+	pmtinternal.EnableCollector = false
+	pmtinternal.CollectorTriggerPages = 0
+	db := MustDB(path, true, func(options *Options) *Options {
+		//options.FS = vfs.Default
+
+		pmtinternal.SetStep1Method(pmtinternal.PlanStep1Simple)
+		pmtinternal.EnablePMTTableFormat = true
+		options.FileFormat = sstable.TableFormatPMT0
+		//options.FileFormat = sstable.TableFormatLevelDB
+
+		pagesize := 4 << 10
+		options.CacheSize = int64(1024 * pagesize) //
+		options.DisableAutomaticCompactions = true
+		options.MaxConcurrentCompactions = func() int { return 8 }
+		return options
+	})
+	defer SavePMTPartIdx(filepath.Join(path, "partidx.json"))
+	defer dumpFlushHistory(0, path)
+
+	const flushConcurrency = 1
+	times := 32 // 128
+	datas := make([]uint64, 0, times<<20)
+	for i := 0; i < times; i++ {
+		path := filepath.Join(datasetPath, fmt.Sprintf("%s_round_%03d.bin", dataset, i))
+		d := LoadDataFile(path)
+		datas = append(datas, d.Keys...)
+	}
+	writeStart := time.Now()
+	for i := 0; i < times; i++ {
+		keys := datas[i<<20 : (i+1)<<20]
+		flushPlan := plan(keys)
+		multilevelFlushConcurrent(db, keys, uint64(i), flushPlan.planList, flushConcurrency)
+		pmtinternal.PartIdx = newPartIdxFrom(flushPlan.planList) // TODO: 不通过CompactionEnd/FlushEnd更新PartIdx
+		println(fmt.Sprintf("multilevelflush done round%d", i))
+	}
+	writeTime := time.Since(writeStart).Milliseconds()
+	totalWrite, totalTableCount := TotalWrite(db)
+	wa := writeAmp(totalWrite, times, sstable.TableFormatPMT0)
+	println(fmt.Sprintf("w=%dMB \t wa=%.2f \t tables=%d \t time=%dms", totalWrite, wa, totalTableCount, writeTime))
+
+	//metrics := stat(db)
+	//use(metrics)
+	stat0 := printPMTStat()
+	println(stat0)
+	printTotalWriteExpectedList()
+	printActiveMergeCountList()
+	// ------------------------------随机读测试
+	//benchmarkRandomReadMultiThread(datas, db, 1)
+	//benchmarkRandomReadMultiThread(datas, db, 4)
+	//benchmarkRandomReadMultiThread(datas, db, 8)
+	//benchmarkRandomReadMultiThread(datas, db, 12)
+	//benchmarkRandomReadMultiThread(datas, db, 16)
+	//benchmarkRandomReadMultiThread(datas, db, 24)
+	//benchmarkRandomReadMultiThread(datas, db, 32)
+	//benchmarkRandomReadMultiThread(datas, db, 48)
+	benchmarkRandomReadMultiThread(datas, db, 64)
+	println(fmt.Sprintf("avgMissProbeCount=%.4f", db.PMTAverageMissProbeCount(datas)))
+	// ------------------------------再均衡测试
+	//delKeys := append([]uint64(nil), datas...)
+	//rand.Shuffle(len(delKeys), func(i, j int) {
+	//	delKeys[i], delKeys[j] = delKeys[j], delKeys[i]
+	//})
+	//delKeys = delKeys[:len(delKeys)/2]
+	//pmtinternal.LogicDel = true
+	//for i := 0; i < times/2; i++ {
+	//	keys := delKeys[i<<20 : (i+1)<<20]
+	//	flushPlan := plan(keys)
+	//	multilevelFlushConcurrent(db, keys, uint64(999), flushPlan.planList, flushConcurrency)
+	//	pmtinternal.PartIdx = newPartIdxFrom(flushPlan.planList) // TODO: 不通过CompactionEnd/FlushEnd更新PartIdx
+	//}
+	//stat1 := printPMTStat()
+	//println(stat0)
+	//println(stat1)
+	//printTotalWriteExpectedList()
+	//printActiveMergeCountList()
+	//benchmarkRandomReadMultiThread(datas, db, 16)
+	//println(fmt.Sprintf("avgMissProbeCount=%.4f", db.PMTAverageMissProbeCount(datas)))
+}
+
+func Test_pmt_del(t *testing.T) {
+	//
+	// db = ..
+	// datas = ..
+	//
+}
+
+//======================================================================================================================
+
+func printPMTStat() string {
+	const (
+		smallFileThreshold = uint64(4 * PageSize)
+		smallPartThreshold = uint64(512 * PageSize)
+		largePartThreshold = uint64(512 * 3 * PageSize)
+	)
+
+	partCount := len(pmtinternal.PartIdx)
+	smallPartCount := 0
+	largePartCount := 0
+	fileCount := 0
+	smallFileCount := 0
+
+	for _, part := range pmtinternal.PartIdx {
+		var partSize uint64
+		for _, fileNum := range part.Stack {
+			info, ok := pmtinternal.SstMap[uint64(fileNum)]
+			if !ok {
+				panic(fmt.Sprintf("printPartStat: file %d not found in SstMap", fileNum))
+			}
+			partSize += info.Size
+			fileCount++
+			if info.Size < smallFileThreshold {
+				smallFileCount++
+			}
+		}
+
+		if partSize < smallPartThreshold {
+			smallPartCount++
+		}
+		if partSize > largePartThreshold {
+			largePartCount++
+		}
+	}
+	ret := fmt.Sprintf("collectorKVCount=%d", len(CurrCollector.Keys))
+	ret += "\n"
+	ret += fmt.Sprintf("partCount=%d, smallPartCount=%d, largePartCount=%d, fileCount=%d, smallFileCount=%d", partCount, smallPartCount, largePartCount, fileCount, smallFileCount)
+	return ret
+}
+
+func TotalWrite(d *DB) (totalWrite int, totalTableCount int) {
+	m := d.Metrics()
+	for level := 0; level < numLevels; level++ {
+		l := &m.Levels[level]
+		totalWrite += int(l.BytesFlushed+l.BytesCompacted) >> 20
+		totalTableCount += int(l.TablesFlushed + l.TablesCompacted)
+	}
+	return
+}
+
+func fileFormatBaseSizeMB(fileFormat sstable.TableFormat) int {
+	switch fileFormat {
+	case sstable.TableFormatPMT0:
+		return 16
+	case sstable.TableFormatLevelDB:
+		return 31
+	default:
+		panic(fmt.Sprintf("unknown fileFormat base size: %v", fileFormat))
+	}
+}
+
+func writeAmp(totalWriteMB int, round int, fileFormat sstable.TableFormat) float64 {
+	baseSizeMB := fileFormatBaseSizeMB(fileFormat)
+	return float64(totalWriteMB) / float64(round*baseSizeMB)
+}
+
+// normal_plus, 128,
+func Test_pmt_r(t *testing.T) {
+	path := "ww/pmt"
+	db := MustDB(path, false, func(options *Options) *Options {
+		options.FS = vfs.Default
+
+		pmtinternal.EnablePMTTableFormat = true
+		options.FileFormat = sstable.TableFormatPMT0
+		//options.FileFormat = sstable.TableFormatPebblev6
+
+		pagesize := 4 << 10 // 4KB
+		options.CacheSize = int64(1024 * pagesize)
+		options.DisableAutomaticCompactions = true
+		options.MaxConcurrentCompactions = func() int { return 8 }
+		options.ReadOnly = true // important
+		return options
+	})
+	db.LoadPMTPartIdxAndRecoverMap(filepath.Join(path, "partidx.json"))
+
+	times := 8 // 128
+	datas := make([]uint64, 0, times<<20)
+	for i := 0; i < times; i++ {
+		path := filepath.Join(datasetPath, fmt.Sprintf("normal_plus_round_%03d.bin", i))
+		d := LoadDataFile(path)
+		datas = append(datas, d.Keys...)
+	}
+
+	benchmarkRandomReadMultiThread(datas, db, 1)
+	benchmarkRandomReadMultiThread(datas, db, 4)
+	benchmarkRandomReadMultiThread(datas, db, 8)
+	benchmarkRandomReadMultiThread(datas, db, 12)
+	benchmarkRandomReadMultiThread(datas, db, 16)
+	benchmarkRandomReadMultiThread(datas, db, 24)
+	benchmarkRandomReadMultiThread(datas, db, 32)
+	benchmarkRandomReadMultiThread(datas, db, 48)
+	benchmarkRandomReadMultiThread(datas, db, 64)
+	println(fmt.Sprintf("avgMissProbeCount=%.4f", db.PMTAverageMissProbeCount(datas)))
+}
+
+//======================================================================================================================
+
 func Test_pmt_basic(t *testing.T) {
 	path := "mem"
 	db := MustDB(path, true, func(options *Options) *Options {
@@ -259,337 +650,6 @@ func Test_MyGet(t *testing.T) {
 	use(tables)
 }
 
-// L0CompactionThreshold = 3, Normal+Uniform+MinMax, deviation=1 << 30
-// 128, 5.65 | 5.41,avg:3.829685 | 5.92
-
-// L0CompactionThreshold = 3, Normal+Uniform+MinMax, deviation=1 << 31
-// 32, 3.96,
-// 64,
-// 96,
-// 128, 5.66, avg:3.827046 |
-
-// L0CompactionThreshold = 3, Normal+Uniform+MinMax, deviation=1 << 32
-// 32, 3.99
-// 64, 4.53
-// 96, 5.05
-// 128, 5.45, avg:3.827048
-
-// L0CompactionThreshold = 3, Uniform
-// 32, 5.5, avg=3.624498
-// 64, 6.6, avg:3.756997
-// 96, 7.44, avg:3.801390
-// 128, 7.72, avg:3.84,
-
-// normal_plus
-// 64, 耗时: 91759+77551=169310=>396.37 Kops
-// 128,
-func Test_pebble_wa(t *testing.T) {
-	path := "ww/pebble"
-	dataset := "normal_plus" // normal_plus or uniform
-	rounds := 32
-	checkpoints := []int{8, 16, 24, 32}
-	randomReadConcurrency := []int{8, 16, 24, 32}
-	reportPath := filepath.Join("ww", fmt.Sprintf("Test_pebble_wa_%s.log", time.Now().Format("02150405")))
-
-	db := MustDB(path, true, EnablePebble, func(options *Options) *Options {
-		options.FS = vfs.Default
-		options.DisableAutomaticCompactions = false
-
-		options.FileFormat = sstable.TableFormatLevelDB
-		pagesize := 4 << 10                        // 4KB
-		options.CacheSize = int64(1024 * pagesize) //
-		options.MaxConcurrentCompactions = func() int { return 8 }
-		return options
-	})
-
-	keys := make([]uint64, 0, rounds<<20)
-	for i := 0; i < rounds; i++ {
-		path := filepath.Join(datasetPath, fmt.Sprintf("%s_round_%03d.bin", dataset, i))
-		d := LoadDataFile(path)
-		keys = append(keys, d.Keys...)
-	}
-
-	var report strings.Builder
-	report.WriteString(fmt.Sprintf("dataset=%s\n\n", dataset))
-
-	checkpointIdx := 0
-	checkPointWriteStart := time.Now()
-	for i := 0; i < rounds; i++ {
-		roundKeys := keys[i<<20 : (i+1)<<20]
-		batchWrite(db, roundKeys, uint64(i))
-		println(fmt.Sprintf("multilevelflush done round%d", i))
-		roundDone := i + 1
-		if checkpointIdx >= len(checkpoints) || roundDone != checkpoints[checkpointIdx] {
-			continue
-		}
-		pebbleCheckpoint(&report, db, keys[:roundDone<<20], roundDone, time.Since(checkPointWriteStart).Milliseconds(), randomReadConcurrency)
-		checkPointWriteStart = time.Now()
-		checkpointIdx++
-	}
-	if err := os.WriteFile(reportPath, []byte(report.String()), 0644); err != nil {
-		panic("write pebble wa log")
-	}
-}
-
-func pebbleStat(db *DB, rounds int, ms int) string {
-	totalWrite, totalTableCount := TotalWrite(db)
-	wa := writeAmp(totalWrite, rounds, sstable.TableFormatLevelDB)
-	return fmt.Sprintf("w=%dMB \t wa=%.2f \t tables=%d \t roundTime=%dms", totalWrite, wa, totalTableCount, ms)
-}
-
-func pebbleCheckpoint(
-	report *strings.Builder, db *DB, keys []uint64, rounds int, writeTime int64, randomReadConcurrency []int,
-) {
-	waitStart := time.Now()
-	for isCompacting(db) {
-		print(".")
-		time.Sleep(100 * time.Millisecond)
-	}
-	waitTime := time.Since(waitStart).Milliseconds()
-	roundStat := pebbleStat(db, rounds, int(writeTime+waitTime))
-	report.WriteString(fmt.Sprintf("%d, %s", rounds, roundStat))
-	report.WriteString("\n")
-	for _, concurrency := range randomReadConcurrency {
-		report.WriteString(benchmarkRandomReadMultiThreadStat(keys, db, concurrency))
-		report.WriteString("\n")
-	}
-	report.WriteString("\n")
-}
-
-func Test_pebble_r(t *testing.T) {
-	path := "ww/pebble"
-	db := MustDB(path, false, EnablePebble, func(options *Options) *Options {
-		options.FS = vfs.Default
-		options.DisableAutomaticCompactions = false
-
-		options.FileFormat = sstable.TableFormatLevelDB
-		pagesize := 4 << 10 // 4KB
-		options.CacheSize = int64(1024 * pagesize)
-		options.MaxConcurrentCompactions = func() int { return 8 }
-
-		options.ReadOnly = true // important
-		return options
-	})
-
-	times := 128 // 48
-	datas := make([]uint64, 0, times<<20)
-	for i := 0; i < times; i++ {
-		path := filepath.Join(datasetPath, fmt.Sprintf("normal_plus_round_%03d.bin", i))
-		d := LoadDataFile(path)
-		datas = append(datas, d.Keys...)
-	}
-
-	//avg(db)
-	benchmarkRandomReadMultiThread(datas, db, 1)
-	benchmarkRandomReadMultiThread(datas, db, 4)
-	benchmarkRandomReadMultiThread(datas, db, 8)
-	benchmarkRandomReadMultiThread(datas, db, 12)
-	benchmarkRandomReadMultiThread(datas, db, 16)
-	benchmarkRandomReadMultiThread(datas, db, 24)
-	benchmarkRandomReadMultiThread(datas, db, 32)
-	benchmarkRandomReadMultiThread(datas, db, 48)
-	benchmarkRandomReadMultiThread(datas, db, 64)
-}
-
-// normal_plus
-// 64, 写耗时: 84448,81142,97571=>687.79 Kops; 点读耗时=
-// 128, 写耗时: 195638,269629,312484,276104,225041=>596.42 Kops
-func Test_pmt_wa(t *testing.T) {
-	path := "ww/pmt"
-	dataset := "uniform" // normal_plus or uniform
-	pmtinternal.EnableCollector = false
-	pmtinternal.CollectorTriggerPages = 0
-	db := MustDB(path, true, func(options *Options) *Options {
-		//options.FS = vfs.Default
-
-		pmtinternal.SetStep1Method(pmtinternal.PlanStep1Simple)
-		pmtinternal.EnablePMTTableFormat = true
-		options.FileFormat = sstable.TableFormatPMT0
-		//options.FileFormat = sstable.TableFormatLevelDB
-
-		pagesize := 4 << 10
-		options.CacheSize = int64(1024 * pagesize) //
-		options.DisableAutomaticCompactions = true
-		options.MaxConcurrentCompactions = func() int { return 8 }
-		return options
-	})
-	defer SavePMTPartIdx(filepath.Join(path, "partidx.json"))
-	defer dumpFlushHistory(0, path)
-
-	const flushConcurrency = 1
-	times := 32 // 128
-	datas := make([]uint64, 0, times<<20)
-	for i := 0; i < times; i++ {
-		path := filepath.Join(datasetPath, fmt.Sprintf("%s_round_%03d.bin", dataset, i))
-		d := LoadDataFile(path)
-		datas = append(datas, d.Keys...)
-	}
-	writeStart := time.Now()
-	for i := 0; i < times; i++ {
-		keys := datas[i<<20 : (i+1)<<20]
-		flushPlan := plan(keys)
-		multilevelFlushConcurrent(db, keys, uint64(i), flushPlan.planList, flushConcurrency)
-		pmtinternal.PartIdx = newPartIdxFrom(flushPlan.planList) // TODO: 不通过CompactionEnd/FlushEnd更新PartIdx
-		println(fmt.Sprintf("multilevelflush done round%d", i))
-	}
-	writeTime := time.Since(writeStart).Milliseconds()
-	totalWrite, totalTableCount := TotalWrite(db)
-	wa := writeAmp(totalWrite, times, sstable.TableFormatPMT0)
-	println(fmt.Sprintf("w=%dMB \t wa=%.2f \t tables=%d \t time=%dms", totalWrite, wa, totalTableCount, writeTime))
-
-	//metrics := stat(db)
-	//use(metrics)
-	stat0 := printPMTStat()
-	println(stat0)
-	printTotalWriteExpectedList()
-	printActiveMergeCountList()
-	// ------------------------------随机读测试
-	//benchmarkRandomReadMultiThread(datas, db, 1)
-	//benchmarkRandomReadMultiThread(datas, db, 4)
-	//benchmarkRandomReadMultiThread(datas, db, 8)
-	//benchmarkRandomReadMultiThread(datas, db, 12)
-	//benchmarkRandomReadMultiThread(datas, db, 16)
-	//benchmarkRandomReadMultiThread(datas, db, 24)
-	//benchmarkRandomReadMultiThread(datas, db, 32)
-	//benchmarkRandomReadMultiThread(datas, db, 48)
-	benchmarkRandomReadMultiThread(datas, db, 64)
-	println(fmt.Sprintf("avgMissProbeCount=%.4f", db.PMTAverageMissProbeCount(datas)))
-	// ------------------------------再均衡测试
-	//delKeys := append([]uint64(nil), datas...)
-	//rand.Shuffle(len(delKeys), func(i, j int) {
-	//	delKeys[i], delKeys[j] = delKeys[j], delKeys[i]
-	//})
-	//delKeys = delKeys[:len(delKeys)/2]
-	//pmtinternal.LogicDel = true
-	//for i := 0; i < times/2; i++ {
-	//	keys := delKeys[i<<20 : (i+1)<<20]
-	//	flushPlan := plan(keys)
-	//	multilevelFlushConcurrent(db, keys, uint64(999), flushPlan.planList, flushConcurrency)
-	//	pmtinternal.PartIdx = newPartIdxFrom(flushPlan.planList) // TODO: 不通过CompactionEnd/FlushEnd更新PartIdx
-	//}
-	//stat1 := printPMTStat()
-	//println(stat0)
-	//println(stat1)
-	//printTotalWriteExpectedList()
-	//printActiveMergeCountList()
-	//benchmarkRandomReadMultiThread(datas, db, 16)
-	//println(fmt.Sprintf("avgMissProbeCount=%.4f", db.PMTAverageMissProbeCount(datas)))
-}
-
-func Test_pmt_del(t *testing.T) {
-	//
-	// db = ..
-	// datas = ..
-	//
-}
-
-// ================================================================
-
-func printPMTStat() string {
-	const (
-		smallFileThreshold = uint64(4 * PageSize)
-		smallPartThreshold = uint64(512 * PageSize)
-		largePartThreshold = uint64(512 * 3 * PageSize)
-	)
-
-	partCount := len(pmtinternal.PartIdx)
-	smallPartCount := 0
-	largePartCount := 0
-	fileCount := 0
-	smallFileCount := 0
-
-	for _, part := range pmtinternal.PartIdx {
-		var partSize uint64
-		for _, fileNum := range part.Stack {
-			info, ok := pmtinternal.SstMap[uint64(fileNum)]
-			if !ok {
-				panic(fmt.Sprintf("printPartStat: file %d not found in SstMap", fileNum))
-			}
-			partSize += info.Size
-			fileCount++
-			if info.Size < smallFileThreshold {
-				smallFileCount++
-			}
-		}
-
-		if partSize < smallPartThreshold {
-			smallPartCount++
-		}
-		if partSize > largePartThreshold {
-			largePartCount++
-		}
-	}
-	ret := fmt.Sprintf("collectorKVCount=%d", len(CurrCollector.Keys))
-	ret += "\n"
-	ret += fmt.Sprintf("partCount=%d, smallPartCount=%d, largePartCount=%d, fileCount=%d, smallFileCount=%d", partCount, smallPartCount, largePartCount, fileCount, smallFileCount)
-	return ret
-}
-
-func TotalWrite(d *DB) (totalWrite int, totalTableCount int) {
-	m := d.Metrics()
-	for level := 0; level < numLevels; level++ {
-		l := &m.Levels[level]
-		totalWrite += int(l.BytesFlushed+l.BytesCompacted) >> 20
-		totalTableCount += int(l.TablesFlushed + l.TablesCompacted)
-	}
-	return
-}
-
-func fileFormatBaseSizeMB(fileFormat sstable.TableFormat) int {
-	switch fileFormat {
-	case sstable.TableFormatPMT0:
-		return 16
-	case sstable.TableFormatLevelDB:
-		return 31
-	default:
-		panic(fmt.Sprintf("unknown fileFormat base size: %v", fileFormat))
-	}
-}
-
-func writeAmp(totalWriteMB int, round int, fileFormat sstable.TableFormat) float64 {
-	baseSizeMB := fileFormatBaseSizeMB(fileFormat)
-	return float64(totalWriteMB) / float64(round*baseSizeMB)
-}
-
-// normal_plus, 128,
-func Test_pmt_r(t *testing.T) {
-	path := "ww/pmt"
-	db := MustDB(path, false, func(options *Options) *Options {
-		options.FS = vfs.Default
-
-		pmtinternal.EnablePMTTableFormat = true
-		options.FileFormat = sstable.TableFormatPMT0
-		//options.FileFormat = sstable.TableFormatPebblev6
-
-		pagesize := 4 << 10 // 4KB
-		options.CacheSize = int64(1024 * pagesize)
-		options.DisableAutomaticCompactions = true
-		options.MaxConcurrentCompactions = func() int { return 8 }
-		options.ReadOnly = true // important
-		return options
-	})
-	db.LoadPMTPartIdxAndRecoverMap(filepath.Join(path, "partidx.json"))
-
-	times := 8 // 128
-	datas := make([]uint64, 0, times<<20)
-	for i := 0; i < times; i++ {
-		path := filepath.Join(datasetPath, fmt.Sprintf("normal_plus_round_%03d.bin", i))
-		d := LoadDataFile(path)
-		datas = append(datas, d.Keys...)
-	}
-
-	benchmarkRandomReadMultiThread(datas, db, 1)
-	benchmarkRandomReadMultiThread(datas, db, 4)
-	benchmarkRandomReadMultiThread(datas, db, 8)
-	benchmarkRandomReadMultiThread(datas, db, 12)
-	benchmarkRandomReadMultiThread(datas, db, 16)
-	benchmarkRandomReadMultiThread(datas, db, 24)
-	benchmarkRandomReadMultiThread(datas, db, 32)
-	benchmarkRandomReadMultiThread(datas, db, 48)
-	benchmarkRandomReadMultiThread(datas, db, 64)
-	println(fmt.Sprintf("avgMissProbeCount=%.4f", db.PMTAverageMissProbeCount(datas)))
-}
-
 // 可能需要用全局变量判断, 目前只用writeBarrierFS
 // 如果写盘不并发，Test_concurrent会卡住
 func Test_concurrent(t *testing.T) {
@@ -644,18 +704,6 @@ func Test_concurrent(t *testing.T) {
 	wg.Wait()
 }
 
-func benchmarkRandomRead(datas []uint64, db *DB) {
-	rand.Shuffle(len(datas), func(i, j int) {
-		datas[i], datas[j] = datas[j], datas[i]
-	})
-	println("start random read benchmark")
-	start := time.Now()
-	for i := 0; i < 1<<20; i++ {
-		db.MustGet(BigEndian(datas[i]))
-	}
-	println(fmt.Sprintf("random read cost %dms", time.Since(start).Milliseconds()))
-}
-
 func benchmarkRandomReadMultiThread(data []uint64, db *DB, concurrency int) {
 	println(benchmarkRandomReadMultiThreadStat(data, db, concurrency))
 }
@@ -708,28 +756,9 @@ func benchmarkRandomReadMultiThreadStat(data []uint64, db *DB, concurrency int) 
 	deltaBlockHits := endMetrics.BlockCache.Hits - startBlockHits
 	deltaBlockMisses := endMetrics.BlockCache.Misses - startBlockMisses
 	return fmt.Sprintf(
-		"randomread%d=%dms, avgFilesAccessed=%.4f, hits=%d, misses=%d, hitRate=%.2f%%",
-		concurrency, cost, avgFilesAccessed, deltaBlockHits, deltaBlockMisses, hitRate(deltaBlockHits, deltaBlockMisses),
+		"randomread%d=%dms, kops=%.2f, avgFilesAccessed=%.4f, hits=%d, misses=%d, hitRate=%.2f%%",
+		concurrency, cost, float64(readN)/float64(cost)/1000, avgFilesAccessed, deltaBlockHits, deltaBlockMisses, hitRate(deltaBlockHits, deltaBlockMisses),
 	)
-}
-
-func benchmarkRandomReadWithCPUProfile(t *testing.T, datas []uint64, db *DB, profPath string) {
-	t.Helper()
-	_ = os.Remove(profPath)
-	f, err := os.Create(profPath)
-	if err != nil {
-		t.Fatalf("create pprof file: %v", err)
-	}
-	if err := pprof.StartCPUProfile(f); err != nil {
-		_ = f.Close()
-		t.Fatalf("start cpu profile: %v", err)
-	}
-	defer func() {
-		pprof.StopCPUProfile()
-		_ = f.Close()
-	}()
-	benchmarkRandomRead(datas, db)
-	t.Logf("pprof cpu profile written to %s", profPath)
 }
 
 func multilevelFlushConcurrent(db *DB, keys []uint64, v uint64, pList []PartPlan, concurrency int) {
