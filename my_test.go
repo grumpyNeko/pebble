@@ -285,14 +285,14 @@ func Test_MyGet(t *testing.T) {
 // 128,
 func Test_pebble_wa(t *testing.T) {
 	path := "ww/pebble"
-	dataset := "uniform" // normal_plus or uniform
+	dataset := "normal_plus" // normal_plus or uniform
 	db := MustDB(path, true, EnablePebble, func(options *Options) *Options {
 		options.FS = vfs.Default
 		options.DisableAutomaticCompactions = false
 
 		options.FileFormat = sstable.TableFormatLevelDB
-		pagesize := 4 << 10                            // 4KB
-		options.CacheSize = int64(1024 * 4 * pagesize) //
+		pagesize := 4 << 10                        // 4KB
+		options.CacheSize = int64(1024 * pagesize) //
 		options.MaxConcurrentCompactions = func() int { return 8 }
 		return options
 	})
@@ -320,16 +320,17 @@ func Test_pebble_wa(t *testing.T) {
 	}
 	compactTime := time.Since(compactWaitStart).Milliseconds()
 	totalWrite, totalTableCount := TotalWrite(db)
-	println(fmt.Sprintf("w=%dMB \t tables=%d \t time=%dms", totalWrite, totalTableCount, writeTime+compactTime))
-
-	benchmarkRandomReadMultiThread(datas, db, 1)
-	benchmarkRandomReadMultiThread(datas, db, 4)
-	benchmarkRandomReadMultiThread(datas, db, 8)
-	benchmarkRandomReadMultiThread(datas, db, 12)
-	benchmarkRandomReadMultiThread(datas, db, 16)
-	benchmarkRandomReadMultiThread(datas, db, 24)
-	benchmarkRandomReadMultiThread(datas, db, 32)
-	benchmarkRandomReadMultiThread(datas, db, 48)
+	wa := writeAmp(totalWrite, times, sstable.TableFormatLevelDB)
+	println(fmt.Sprintf("w=%dMB \t wa=%.2f \t tables=%d \t time=%dms", totalWrite, wa, totalTableCount, writeTime+compactTime))
+	// random read
+	//benchmarkRandomReadMultiThread(datas, db, 1)
+	//benchmarkRandomReadMultiThread(datas, db, 4)
+	//benchmarkRandomReadMultiThread(datas, db, 8)
+	//benchmarkRandomReadMultiThread(datas, db, 12)
+	//benchmarkRandomReadMultiThread(datas, db, 16)
+	//benchmarkRandomReadMultiThread(datas, db, 24)
+	//benchmarkRandomReadMultiThread(datas, db, 32)
+	//benchmarkRandomReadMultiThread(datas, db, 48)
 	benchmarkRandomReadMultiThread(datas, db, 64)
 
 	// 512page
@@ -439,7 +440,7 @@ func Test_pmt_wa(t *testing.T) {
 	db := MustDB(path, true, func(options *Options) *Options {
 		//options.FS = vfs.Default
 
-		pmtinternal.SetStep1Method(pmtinternal.PlanStep1V4)
+		pmtinternal.SetStep1Method(pmtinternal.PlanStep1Simple)
 		pmtinternal.EnablePMTTableFormat = true
 		options.FileFormat = sstable.TableFormatPMT0
 		//options.FileFormat = sstable.TableFormatLevelDB
@@ -454,7 +455,7 @@ func Test_pmt_wa(t *testing.T) {
 	defer dumpFlushHistory(0, path)
 
 	const flushConcurrency = 1
-	times := 96 // 128
+	times := 32 // 128
 	datas := make([]uint64, 0, times<<20)
 	for i := 0; i < times; i++ {
 		path := filepath.Join(datasetPath, fmt.Sprintf("%s_round_%03d.bin", dataset, i))
@@ -471,7 +472,8 @@ func Test_pmt_wa(t *testing.T) {
 	}
 	writeTime := time.Since(writeStart).Milliseconds()
 	totalWrite, totalTableCount := TotalWrite(db)
-	println(fmt.Sprintf("w=%dMB \t tables=%d \t time=%dms", totalWrite, totalTableCount, writeTime))
+	wa := writeAmp(totalWrite, times, sstable.TableFormatPMT0)
+	println(fmt.Sprintf("w=%dMB \t wa=%.2f \t tables=%d \t time=%dms", totalWrite, wa, totalTableCount, writeTime))
 
 	//metrics := stat(db)
 	//use(metrics)
@@ -569,6 +571,22 @@ func TotalWrite(d *DB) (totalWrite int, totalTableCount int) {
 		totalTableCount += int(l.TablesFlushed + l.TablesCompacted)
 	}
 	return
+}
+
+func fileFormatBaseSizeMB(fileFormat sstable.TableFormat) int {
+	switch fileFormat {
+	case sstable.TableFormatPMT0:
+		return 16
+	case sstable.TableFormatLevelDB:
+		return 31
+	default:
+		panic(fmt.Sprintf("unknown fileFormat base size: %v", fileFormat))
+	}
+}
+
+func writeAmp(totalWriteMB int, round int, fileFormat sstable.TableFormat) float64 {
+	baseSizeMB := fileFormatBaseSizeMB(fileFormat)
+	return float64(totalWriteMB) / float64(round*baseSizeMB)
 }
 
 // normal_plus, 128,

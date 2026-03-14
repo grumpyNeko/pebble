@@ -138,8 +138,9 @@ func pmtOptions() *Options {
 			 c.startLevel.files.Len() == 1
 		   要求L0只有一个文件, 有点蠢
 	*/
-	opts.L0CompactionThreshold = 4
-	opts.L0StopWritesThreshold = 5
+	//opts.L0CompactionThreshold = 8
+	//opts.L0StopWritesThreshold = 10
+	//opts.L0CompactionFileThreshold = 10000
 	opts.MaxConcurrentCompactions = func() int { return 8 }
 	const pagesize = 4096
 	opts.CacheSize = 256 * pagesize
@@ -162,7 +163,9 @@ func EnablePebble(opts *Options) *Options {
 	opts.FileFormat = sstable.TableFormatLevelDB
 	opts.Experimental.MultiLevelCompactionHeuristic = NoMultiLevel{}
 
-	opts.L0StopWritesThreshold = 5
+	opts.L0CompactionThreshold = 10
+	opts.L0StopWritesThreshold = 10
+	opts.L0CompactionFileThreshold = 10000
 	return opts
 }
 
