@@ -169,17 +169,19 @@ oldCost_i表示     已有的文件
 
 # plan
 ```
-plan(keys)
+plan(keys, budget)
 	flushPlan = planStep1(keys)
-	flushPlan = mergeAdjacent_wt0(flushPlan)
+	flushPlan = mergeAdjacentWt0(flushPlan)
+	avg = 根据前几次totalWriteExpected的均值
 	if flushPlan.totalWriteExpected < **
-		flushPlan = activeMergePlan(flushPlan, extraWriteThreshold)
+	  budget = min(avg-flushPlan.totalWriteExpected, budget) 
+		flushPlan = push(flushPlan, budget)
 		flushPlan = mergeAdjacent_wt0(flushPlan)
 	if flushPlan.totalWriteExpected > **
-	  flushPlan = delaySmallCompaction(flushPlan)
+	  flushPlan = push(flushPlan)
 	return flushPlan
 
-mergeAdjacent_wt0(planList) {
+mergeAdjacentWt0(planList) {
   mergeCount = 0
   newPlanList = []
   for idx,p in planList
@@ -195,12 +197,12 @@ mergeAdjacent_wt0(planList) {
 }
 
 // 提前压实, 促进区间再均衡
-activeMergePlan(flushplan) {
+push(flushplan, budget) {
 	pushList = []
 	for ppIdx in flushplan.wt0
-	  prev = ..
-	  succ = ..
-	  push, ok = prev和succ中更小的
+	  prev = ppIdx - 1
+	  succ = ppIdx + 1
+	  push, ok = choose from prev succ
 	  continue if !ok 
 	  extraWrite = 提前压实相比原方案多出来的写入量
 	  pushList += {tryPush, extraWrite}
@@ -208,10 +210,10 @@ activeMergePlan(flushplan) {
 	pushList按extraWrite升序
 	totalExtraWrite = 0
 	for {idx, extraWrite} in tryPushList
-	  break if totalExtraWrite + extraWrite > **
+	  break if totalExtraWrite + extraWrite > budget
 	  flushplan.wt0 += idx
 	  flushplan.plist[idx] <- writeTo=0, reason=advance
-	  flushPlan.totalExtraWrite += 提前压实的额外写入量
+	  flushPlan.totalExtraWrite += extraWrite
 	  flushplan.activeMergeCount++
 	return flushplan
 }
@@ -241,7 +243,7 @@ chooseTryPushIdx(flushPlan, wt0Idx) (int, uint64) {
 		if extraWrite < bestWrite 
 			bestIdx = idx
 			bestWrite = extraWrite
-
+  }
 	tryUpdate(wt0Idx - 1)
 	tryUpdate(wt0Idx + 1)
 
