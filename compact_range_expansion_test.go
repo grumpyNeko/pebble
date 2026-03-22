@@ -17,8 +17,6 @@ import (
 	"github.com/cockroachdb/pebble/vfs"
 )
 
-const compactRangeExpansionRounds = 8
-
 type compactRangeExpansionTarget struct {
 	low       uint64
 	high      uint64
@@ -32,39 +30,38 @@ type compactRangeTargets struct {
 	last    compactRangeExpansionTarget
 }
 
-// 打印格式global-4MB inputMB=11.22 range=[4413823613294,4415363229500] inputs=[2.32,0.45,0.41,0.03,..]
-func Test_compact_range_expansion_input_size(t *testing.T) {
+func Test_compact_range(t *testing.T) {
 	dataset := "normal_plus" // normal_plus or uniform
-	rounds := loadRounds(t, dataset)
-	globalDB := buildGlobalState(t, rounds)
-	defer func() {
+	roundsNs := []int{5, 6, 7, 8}
+	lines := make([]string, 0, 32)
+	for _, roundsN := range roundsNs {
+		rounds := loadRounds(t, dataset, roundsN)
+		globalDB := buildGlobalState(t, rounds)
+		// 先跑PMT确定范围
+		targets := pickTargets(t)
+		lines = append(lines, fmt.Sprintf("dataset=%s rounds=%d", dataset, len(rounds)))
+		cases := []struct {
+			name   string
+			target compactRangeExpansionTarget
+		}{
+			{name: "deepest", target: targets.deepest},
+			//{name: "first", target: targets.first},
+			//{name: "last", target: targets.last},
+		}
+		for _, tc := range cases {
+			globalBytes, globalSizes := pmtCompactRange(tc.target.low, tc.target.high)
+			layered2Bytes, layered2Low, layered2High, layered2Sizes := measureLayered(t, rounds, 2<<20, tc.target.low, tc.target.high)
+			layered4Bytes, layered4Low, layered4High, layered4Sizes := measureLayered(t, rounds, 4<<20, tc.target.low, tc.target.high)
+
+			lines = append(lines, fmt.Sprintf("%s partIdx=%d partDepth=%d range=[%d,%d]", tc.name, tc.target.partIdx, tc.target.partDepth, tc.target.low, tc.target.high))
+			lines = append(lines, fmt.Sprintf("layered-2MB\tinputMB=%.2f range=[%d,%d] inputs=[%s]", bytesToMB(layered2Bytes), layered2Low, layered2High, formatSizes(layered2Sizes)))
+			lines = append(lines, fmt.Sprintf("layered-4MB\tinputMB=%.2f range=[%d,%d] inputs=[%s]", bytesToMB(layered4Bytes), layered4Low, layered4High, formatSizes(layered4Sizes)))
+			lines = append(lines, fmt.Sprintf("global-4MB\tinputMB=%.2f range=[%d,%d] inputs=[%s]", bytesToMB(globalBytes), tc.target.low, tc.target.high, formatSizes(globalSizes)))
+		}
+		lines = append(lines, "")
 		if err := globalDB.Close(); err != nil {
 			t.Fatal(err)
 		}
-	}()
-	// 先跑 PMT 固定住目标分区。
-	// Pebble 只消费这些范围，不自己重新选范围。
-	targets := pickTargets(t)
-	lines := make([]string, 0, 12)
-	lines = append(lines, fmt.Sprintf("dataset=%s rounds=%d", dataset, len(rounds)))
-	cases := []struct {
-		name   string
-		target compactRangeExpansionTarget
-	}{
-		{name: "deepest", target: targets.deepest},
-		{name: "first", target: targets.first},
-		{name: "last", target: targets.last},
-	}
-	for _, tc := range cases {
-		_, globalBytes := pmtCompactRange(tc.target.low, tc.target.high)
-		globalSizes := pmtSizes(tc.target.low, tc.target.high)
-		layered2Bytes, layered2Low, layered2High, layered2Sizes := measureLayered(t, rounds, 2<<20, tc.target.low, tc.target.high)
-		layered4Bytes, layered4Low, layered4High, layered4Sizes := measureLayered(t, rounds, 4<<20, tc.target.low, tc.target.high)
-
-		lines = append(lines, fmt.Sprintf("%s partIdx=%d partDepth=%d range=[%d,%d]", tc.name, tc.target.partIdx, tc.target.partDepth, tc.target.low, tc.target.high))
-		lines = append(lines, fmt.Sprintf("layered-2MB\tinputMB=%.2f range=[%d,%d] inputs=[%s]", bytesToMB(layered2Bytes), layered2Low, layered2High, formatSizes(layered2Sizes)))
-		lines = append(lines, fmt.Sprintf("layered-4MB\tinputMB=%.2f range=[%d,%d] inputs=[%s]", bytesToMB(layered4Bytes), layered4Low, layered4High, formatSizes(layered4Sizes)))
-		lines = append(lines, fmt.Sprintf("global-4MB\tinputMB=%.2f range=[%d,%d] inputs=[%s]", bytesToMB(globalBytes), tc.target.low, tc.target.high, formatSizes(globalSizes)))
 	}
 	writeReport(t, dataset, lines)
 	for _, line := range lines {
@@ -72,11 +69,11 @@ func Test_compact_range_expansion_input_size(t *testing.T) {
 	}
 }
 
-func loadRounds(t *testing.T, dataset string) [][]uint64 {
+func loadRounds(t *testing.T, dataset string, roundsN int) [][]uint64 {
 	t.Helper()
 
-	ret := make([][]uint64, 0, compactRangeExpansionRounds)
-	for i := 0; i < compactRangeExpansionRounds; i++ {
+	ret := make([][]uint64, 0, roundsN)
+	for i := 0; i < roundsN; i++ {
 		path := filepath.Join(datasetPath, fmt.Sprintf("%s_round_%03d.bin", dataset, i))
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("missing dataset %s; run Test_gen_data", path)
@@ -267,27 +264,6 @@ func sumLevelFiles(files manifest.LevelSlice) (int, uint64, uint64, uint64, []ui
 		}
 	}
 	return totalFiles, totalBytes, low, high, sizes
-}
-
-// PMT does not expand the range.
-// The input set is exactly the stack of the partition containing [low, high].
-func pmtSizes(low uint64, high uint64) []uint64 {
-	part, ok := pmtPartForKey(low)
-	if !ok {
-		panic("part not found")
-	}
-	if high > part.High {
-		panic("range crosses part")
-	}
-	sizes := make([]uint64, 0, len(part.Stack))
-	for _, fileNum := range part.Stack {
-		info, ok := pmtinternal.SstMap[uint64(fileNum)]
-		if !ok {
-			panic(fmt.Sprintf("file %d not found", fileNum))
-		}
-		sizes = append(sizes, info.Size)
-	}
-	return sizes
 }
 
 func formatSizes(sizes []uint64) string {

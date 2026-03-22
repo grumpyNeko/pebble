@@ -33,7 +33,7 @@ func Test_pebble_wa(t *testing.T) {
 	dataset := "normal_plus" // normal_plus or uniform
 	rounds := 128
 	checkpoints := []int{32, 64, 96, 128}
-	randomReadConcurrency := []int{8, 16, 24, 32}
+	randomReadConcurrency := []int{1, 8, 16, 24, 32}
 	reportPath := filepath.Join("ww", fmt.Sprintf("Test_pebble_wa_%s.log", time.Now().Format("02150405")))
 
 	db := MustDB(path, true, EnablePebble, func(options *Options) *Options {
@@ -94,7 +94,7 @@ type checkpointStat struct {
 
 func checkpointSummary(totalWriteMB int, totalTableCount int, rounds int, ms int, tableFormat sstable.TableFormat) string {
 	wa := writeAmp(totalWriteMB, rounds, tableFormat)
-	return fmt.Sprintf("w=%dMB \t wa=%.2f \t tables=%d \t roundTime=%dms \t kops=%.2f", totalWriteMB, wa, totalTableCount, ms, float64(rounds*(1<<20))/float64(ms)/1000)
+	return fmt.Sprintf("w=%dMB \t wa=%.2f \t tables=%d \t roundTime=%dms \t kops=%.2f", totalWriteMB, wa, totalTableCount, ms, float64(rounds*(1<<20))/float64(ms))
 }
 
 func checkpointRandomReads(db *DB, keys []uint64, randomReadConcurrency []int) []string {
@@ -764,7 +764,7 @@ func benchmarkRandomReadMultiThreadStat(data []uint64, db *DB, concurrency int) 
 	deltaBlockMisses := endMetrics.BlockCache.Misses - startBlockMisses
 	return fmt.Sprintf(
 		"randomread%d=%dms, kops=%.2f, avgFilesAccessed=%.4f, hits=%d, misses=%d, hitRate=%.2f%%",
-		concurrency, cost, float64(readN)/float64(cost)/1000, avgFilesAccessed, deltaBlockHits, deltaBlockMisses, hitRate(deltaBlockHits, deltaBlockMisses),
+		concurrency, cost, float64(readN)/float64(cost), avgFilesAccessed, deltaBlockHits, deltaBlockMisses, hitRate(deltaBlockHits, deltaBlockMisses),
 	)
 }
 

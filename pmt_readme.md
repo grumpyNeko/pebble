@@ -1,4 +1,4 @@
-# 如何运行性能测试
+# 核心性能测试
 在仓库根目录运行以下3个
 
 先生成数据:
@@ -10,6 +10,16 @@
 测试PMT性能, 结果在`ww/Test_pmt_wa_*.log`:
 `go test -run '^Test_pmt_wa$' -count=1 -v .`
 
+如何解读结果?
+``` 
+total: w=2690MB 	 wa=1.31 	 tables=3185 	 roundTime=24625ms 	 kops=545
+``` 
+表示写入量2690MB, 写放大为1.31, 耗时24625ms...
+```
+randomread8=6565ms, kops=160, avgFilesAccessed=2.3934, hits=1436160, misses=3663626, hitRate=28.16%
+``` 
+表示8线程随机查找, 耗时6565ms, 重叠度为2.3934...
+
 测试性能, 使用的数据集如何修改? 
 `dataset := "normal_plus" // normal_plus or uniform`
 
@@ -18,6 +28,13 @@
 
 测试pmt性能, 第一阶段计划方式如何修改?
 `pmtinternal.SetStep1Method(pmtinternal.PlanStep1V4) // pmtinternal.PlanStep1V4, pmtinternal.PlanStep1Simple`
+
+# 测试: 指定范围
+确保已经过生成数据, 运行`go test -run '^Test_compact_range_expansion_input_size$' -count=1 -v .`, 结果在ww/compact_range_expansion_%s.txt
+``` 
+layered-2MB	inputMB=12.00 range=[4399275004310,4401205998319] inputs=[2.00,2.00,2.00,2.00,2.00,2.00]
+```
+表示层内划分2MB, 写入量=12MB
 
 ------------------------------------
 
