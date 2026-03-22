@@ -28,30 +28,6 @@ import (
 
 const datasetPath = "ww/dataset"
 
-// L0CompactionThreshold = 3, Normal+Uniform+MinMax, deviation=1 << 30
-// 128, 5.65 | 5.41,avg:3.829685 | 5.92
-
-// L0CompactionThreshold = 3, Normal+Uniform+MinMax, deviation=1 << 31
-// 32, 3.96,
-// 64,
-// 96,
-// 128, 5.66, avg:3.827046 |
-
-// L0CompactionThreshold = 3, Normal+Uniform+MinMax, deviation=1 << 32
-// 32, 3.99
-// 64, 4.53
-// 96, 5.05
-// 128, 5.45, avg:3.827048
-
-// L0CompactionThreshold = 3, Uniform
-// 32, 5.5, avg=3.624498
-// 64, 6.6, avg:3.756997
-// 96, 7.44, avg:3.801390
-// 128, 7.72, avg:3.84,
-
-// normal_plus
-// 64, 耗时: 91759+77551=169310=>396.37 Kops
-// 128,
 func Test_pebble_wa(t *testing.T) {
 	path := "ww/pebble"
 	dataset := "normal_plus" // normal_plus or uniform
@@ -210,6 +186,7 @@ func formatCheckpointStats(stats []checkpointStat, tableFormat sstable.TableForm
 
 func Test_pebble_r(t *testing.T) {
 	path := "ww/pebble"
+	dataset := "normal_plus" // normal_plus or uniform
 	db := MustDB(path, false, EnablePebble, func(options *Options) *Options {
 		options.FS = vfs.Default
 		options.DisableAutomaticCompactions = false
@@ -226,7 +203,7 @@ func Test_pebble_r(t *testing.T) {
 	times := 128 // 48
 	datas := make([]uint64, 0, times<<20)
 	for i := 0; i < times; i++ {
-		path := filepath.Join(datasetPath, fmt.Sprintf("normal_plus_round_%03d.bin", i))
+		path := filepath.Join(datasetPath, fmt.Sprintf("%s_round_%03d.bin", dataset, i))
 		d := LoadDataFile(path)
 		datas = append(datas, d.Keys...)
 	}
@@ -254,17 +231,17 @@ func Test_pmt_wa(t *testing.T) {
 	randomReadConcurrency := []int{8, 16, 24, 32}
 
 	pmtinternal.EnableCollector = true
-	pmtinternal.CollectorTriggerPages = 3
+	pmtinternal.CollectorTriggerPages = 3 // 3, 2, 1, 0
 	db := MustDB(path, true, func(options *Options) *Options {
-		//options.FS = vfs.Default
+		options.FS = vfs.Default
 
-		pmtinternal.SetStep1Method(pmtinternal.PlanStep1V4)
+		pmtinternal.SetStep1Method(pmtinternal.PlanStep1V4) // pmtinternal.PlanStep1V4, pmtinternal.PlanStep1Simple
 		pmtinternal.EnablePMTTableFormat = true
 		options.FileFormat = sstable.TableFormatPMT0
 		//options.FileFormat = sstable.TableFormatLevelDB
 
 		pagesize := 4 << 10
-		options.CacheSize = int64(1024 * pagesize) //
+		options.CacheSize = int64(1024 * pagesize)
 		options.DisableAutomaticCompactions = true
 		options.MaxConcurrentCompactions = func() int { return 8 }
 		return options
@@ -309,9 +286,9 @@ func Test_pmt_wa(t *testing.T) {
 		panic("write pmt wa log")
 	}
 	printTotalWriteExpectedList()
-	printActiveMergeCountList()
+	//printActiveMergeCountList()
 
-	// ------------------------------再均衡测试
+	// -----------------------------------再均衡测试------------------------------------------------------------------------
 	// delete 25%
 	//delKeys := append([]uint64(nil), datas...)
 	//rand.Shuffle(len(delKeys), func(i, j int) {
@@ -342,13 +319,6 @@ func Test_pmt_wa(t *testing.T) {
 	//
 	//println(stat0)
 	//println(stat1)
-}
-
-func Test_pmt_del(t *testing.T) {
-	//
-	// db = ..
-	// datas = ..
-	//
 }
 
 //======================================================================================================================
@@ -636,10 +606,6 @@ func (tr pmtTestReadable) ReadAt(_ context.Context, p []byte, off int64) error {
 
 func (pmtTestReadable) Close() error {
 	return nil
-}
-
-func Test_PMT_CompactAndWrite(t *testing.T) {
-	// todo: ..
 }
 
 func Test_split(t *testing.T) {

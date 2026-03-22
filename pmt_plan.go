@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 const (
@@ -28,6 +29,11 @@ type PartPlanStat struct {
 	Reason string
 }
 
+type PlanTiming struct {
+	total time.Duration
+	step1 time.Duration
+}
+
 type FlushPlanStat struct {
 	passiveMergeCount  int // todo
 	activeMergeCount   int // todo
@@ -35,6 +41,7 @@ type FlushPlanStat struct {
 	totalWriteExpected uint64
 	totalExtraWrite    uint64
 	totalReducedWrite  uint64
+	timing             PlanTiming
 	wt0                []int
 	plans              []PartPlanStat
 }
@@ -48,6 +55,7 @@ type FlushPlan struct {
 	totalWriteExpected uint64
 	totalExtraWrite    uint64
 	totalReducedWrite  uint64
+	timing             PlanTiming
 	wt0                []int // writeTo==0
 	planList           []PartPlan
 }
@@ -64,7 +72,9 @@ func planStep1(newKeys []uint64) FlushPlan {
 }
 
 func plan(newKeys []uint64) FlushPlan {
+	planStart := time.Now()
 	flushPlan := planStep1(newKeys)
+	flushPlan.timing.step1 = time.Since(planStart)
 	newPlanList, mergeCount := mergeAdjacent_wt0(flushPlan.planList)
 	flushPlan.planList = newPlanList
 	flushPlan.passiveMergeCount = mergeCount
@@ -80,7 +90,8 @@ func plan(newKeys []uint64) FlushPlan {
 		//	flushPlan = delaySmallCompaction(flushPlan)
 		//}
 	}
-	recordFlushPlan(flushPlan) // todo: 不应该在这里
+	flushPlan.timing.total = time.Since(planStart)
+	recordFlushPlan(&flushPlan) // todo: 不应该在这里
 	return flushPlan
 }
 
@@ -187,47 +198,6 @@ func step1V4(newKeys []uint64) FlushPlan {
 	}
 }
 
-func collectWt0(planList []PartPlan) []int {
-	ret := make([]int, 0, len(planList))
-	for i := range planList {
-		if planList[i].WriteTo == 0 {
-			ret = append(ret, i)
-		}
-	}
-	return ret
-}
-
-func stackPagesFromFiles(stack []FileNum) []uint64 {
-	pages := make([]uint64, 0, len(stack))
-	for _, fn := range stack {
-		info, ok := pmtinternal.SstMap[uint64(fn)]
-		if !ok {
-			panic(fmt.Sprintf("plan snapshot: file %d not found in SstMap", fn))
-		}
-		pages = append(pages, sstSizeInPages(info.Size))
-	}
-	return pages
-}
-
-func partPlanStatFromPlan(pp PartPlan) PartPlanStat {
-	return PartPlanStat{
-		PartLow:  pp.low,
-		PartHigh: pp.High,
-		NewPages: pp.NewPageCount,
-		WriteTo:  pp.WriteTo,
-		Stack:    stackPagesFromFiles(pp.Stack),
-		Reason:   pp.Reason,
-	}
-}
-
-func snapshotPartPlanStats(planList []PartPlan) []PartPlanStat {
-	stats := make([]PartPlanStat, 0, len(planList))
-	for _, pp := range planList {
-		stats = append(stats, partPlanStatFromPlan(pp))
-	}
-	return stats
-}
-
 func costV4(stack []base.FileNum, newPages int, writeTo int) float64 {
 	const (
 		C = 4
@@ -285,6 +255,47 @@ func doStep1V4PartPlan(p pmtinternal.Part, newPages int) (uint16, string, uint64
 	return uint16(writeTo), reason, writeExpected
 }
 
+func collectWt0(planList []PartPlan) []int {
+	ret := make([]int, 0, len(planList))
+	for i := range planList {
+		if planList[i].WriteTo == 0 {
+			ret = append(ret, i)
+		}
+	}
+	return ret
+}
+
+func stackPagesFromFiles(stack []FileNum) []uint64 {
+	pages := make([]uint64, 0, len(stack))
+	for _, fn := range stack {
+		info, ok := pmtinternal.SstMap[uint64(fn)]
+		if !ok {
+			panic(fmt.Sprintf("plan snapshot: file %d not found in SstMap", fn))
+		}
+		pages = append(pages, sstSizeInPages(info.Size))
+	}
+	return pages
+}
+
+func partPlanStatFromPlan(pp PartPlan) PartPlanStat {
+	return PartPlanStat{
+		PartLow:  pp.low,
+		PartHigh: pp.High,
+		NewPages: pp.NewPageCount,
+		WriteTo:  pp.WriteTo,
+		Stack:    stackPagesFromFiles(pp.Stack),
+		Reason:   pp.Reason,
+	}
+}
+
+func snapshotPartPlanStats(planList []PartPlan) []PartPlanStat {
+	stats := make([]PartPlanStat, 0, len(planList))
+	for _, pp := range planList {
+		stats = append(stats, partPlanStatFromPlan(pp))
+	}
+	return stats
+}
+
 func sumStackPagesFrom(stack []FileNum, from int) uint64 {
 	if from < 0 || from > len(stack) {
 		panic("invalid from")
@@ -307,7 +318,7 @@ func sstSizeInPages(size uint64) uint64 {
 	return (size + uint64(PageSize) - 1) / uint64(PageSize)
 }
 
-func recordFlushPlan(flushPlan FlushPlan) {
+func recordFlushPlan(flushPlan *FlushPlan) {
 	wt0 := append([]int(nil), flushPlan.wt0...)
 	flushHistory = append(flushHistory, FlushPlanStat{
 		passiveMergeCount:  flushPlan.passiveMergeCount,
@@ -316,6 +327,7 @@ func recordFlushPlan(flushPlan FlushPlan) {
 		totalWriteExpected: flushPlan.totalWriteExpected,
 		totalExtraWrite:    flushPlan.totalExtraWrite,
 		totalReducedWrite:  flushPlan.totalReducedWrite,
+		timing:             flushPlan.timing,
 		wt0:                wt0,
 		plans:              snapshotPartPlanStats(flushPlan.planList),
 	})
@@ -508,6 +520,8 @@ func dumpFlushHistory(startFrom int, path string) {
 			"------totalWriteExpected: %d\n"+
 				"------totalExtraWrite: %d\n"+
 				"------totalReducedWrite: %d\n"+
+				"------planTotal: %s\n"+
+				"------planStep1: %s\n"+
 				"------passiveMergeCount: %d\n"+
 				"------activeMergeCount: %d\n"+
 				"------delayCompactCount: %d\n"+
@@ -515,6 +529,8 @@ func dumpFlushHistory(startFrom int, path string) {
 			flushHistory[flushID].totalWriteExpected,
 			flushHistory[flushID].totalExtraWrite,
 			flushHistory[flushID].totalReducedWrite,
+			flushHistory[flushID].timing.total,
+			flushHistory[flushID].timing.step1,
 			flushHistory[flushID].passiveMergeCount,
 			flushHistory[flushID].activeMergeCount,
 			flushHistory[flushID].delayCompactCount,

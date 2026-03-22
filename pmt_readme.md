@@ -1,3 +1,26 @@
+# 如何运行性能测试
+在仓库根目录运行以下3个
+
+先生成数据:
+`go test -run '^Test_gen_data$' -count=1 -v .`
+
+测试Pebble性能, 结果在`ww/Test_pebble_wa_*.log`:
+`go test -run '^Test_pebble_wa$' -count=1 -v .`
+
+测试PMT性能, 结果在`ww/Test_pmt_wa_*.log`:
+`go test -run '^Test_pmt_wa$' -count=1 -v .`
+
+测试性能, 使用的数据集如何修改? 
+`dataset := "normal_plus" // normal_plus or uniform`
+
+测试pmt性能, 收集器阈值如何修改? 
+`pmtinternal.CollectorTriggerPages = 3 // 3, 2, 1, 0`
+
+测试pmt性能, 第一阶段计划方式如何修改?
+`pmtinternal.SetStep1Method(pmtinternal.PlanStep1V4) // pmtinternal.PlanStep1V4, pmtinternal.PlanStep1Simple`
+
+------------------------------------
+
 # Part和PartIdx
 把键范围切成若干Part
 每个Part都是{key,files,..}
@@ -185,7 +208,7 @@ mergeAdjacentWt0(planList) {
   mergeCount = 0
   newPlanList = []
   for idx,p in planList
-    if p.WriteTo != 0
+    if p.WriteTo != 0 
       newPlanList += p
       continue
     if newPlanList[-1].WriteTo != 0 
@@ -209,7 +232,7 @@ push(flushplan, budget) {
 	pushList去重
 	pushList按extraWrite升序
 	totalExtraWrite = 0
-	for {idx, extraWrite} in tryPushList
+	for {idx, extraWrite} in pushList
 	  break if totalExtraWrite + extraWrite > budget
 	  flushplan.wt0 += idx
 	  flushplan.plist[idx] <- writeTo=0, reason=advance
@@ -218,18 +241,19 @@ push(flushplan, budget) {
 	return flushplan
 }
 
+// todo: break if reach budget
 // 新数据少就推迟压实, 减少写入峰值
 delay(flushPlan) FlushPlan {
+  sort flushPlan.wt0 by NewPages/RewritePages
 	for idx in flushPlan.wt0 
 		pp = flushPlan.planList[idx]
-		continue if pp.NewPages >= DelayCompactNewPagesThreshold 
+		continue if pp.NewPages/pp.RewritePages >= DelayCompactNewPagesThreshold 
 		remove idx from flushPlan.wt0 
-		pp.WriteTo = newWriteTo
+		pp.WriteTo ++ // 直接设置为stack.len会出问题
 		reducedWrite = ..
 		flushPlan.totalWriteExpected -= reducedWrite
 		flushPlan.totalReducedWrite += reducedWrite
 		flushPlan.delayCompactCount++
-	}
 	flushPlan.wt0 = collectWt0(flushPlan.planList)
 	return flushPlan
 }
