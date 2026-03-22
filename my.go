@@ -499,6 +499,32 @@ func pmtPartForKey(k uint64) (pmtinternal.Part, bool) {
 	return pmtinternal.Part{}, false
 }
 
+// pmtCompactRange selects files for the single PMT partition containing [low, high].
+// It does not execute compaction; it only sums selected file sizes.
+func pmtCompactRange(low uint64, high uint64) (fileCount int, totalBytes uint64) {
+	if low > high {
+		panic("invalid range")
+	}
+	part, ok := pmtPartForKey(low)
+	if !ok {
+		panic("part not found")
+	}
+	if high > part.High {
+		panic("range crosses part")
+	}
+	if len(part.Stack) == 0 {
+		panic("empty part")
+	}
+	for _, fileNum := range part.Stack {
+		info, ok := pmtinternal.SstMap[uint64(fileNum)]
+		if !ok {
+			panic(fmt.Sprintf("file %d not found", fileNum))
+		}
+		totalBytes += info.Size
+	}
+	return len(part.Stack), totalBytes
+}
+
 func pmtCollectorBoundsForFlush(keys []uint64, files []base.FileNum) (low uint64, high uint64, ok bool) {
 	if len(keys) > 0 {
 		part, ok := pmtPartForKey(keys[0])

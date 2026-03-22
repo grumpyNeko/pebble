@@ -277,6 +277,11 @@ func (r *Runner) TableSplitLimit(startKey []byte) []byte {
 	if startKey == nil {
 		panic("why?")
 	}
+	// PMT uses PartIdx boundaries to force output sstable splits.
+	// Pebble should keep its original size-based splitting logic.
+	if !pmtinternal.EnablePMT {
+		return nil
+	}
 
 	splitKeys := []uint64{}
 	for _, e := range pmtinternal.PartIdx {
