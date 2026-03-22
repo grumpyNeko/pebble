@@ -228,7 +228,7 @@ func Test_pmt_wa(t *testing.T) {
 	dataset := "normal_plus" // normal_plus or uniform
 	times := 128             // 128
 	checkpoints := []int{32, 64, 96, 128}
-	randomReadConcurrency := []int{8, 16, 24, 32}
+	randomReadConcurrency := []int{1, 8, 16, 24, 32}
 
 	pmtinternal.EnableCollector = true
 	pmtinternal.CollectorTriggerPages = 3 // 3, 2, 1, 0

@@ -1,14 +1,20 @@
-# 核心性能测试
-在仓库根目录运行以下3个
+# 性能测试前先生成数据
+`go test -run '^Test_gen_data$' -count=1 -v -timeout 30m .`
 
-先生成数据:
-`go test -run '^Test_gen_data$' -count=1 -v .`
+# 测试: 指定范围
+运行`go test -run '^Test_compact_range_expansion_input_size$' -count=1 -v -timeout 30m .`, 结果在ww/compact_range_expansion_%s.txt
 
+``` 
+layered-2MB	inputMB=12.00 range=[4399275004310,4401205998319] inputs=[2.00,2.00,2.00,2.00,2.00,2.00]
+```
+表示层内划分2MB, 写入量=12MB
+
+# 核心性能测试框架
 测试Pebble性能, 结果在`ww/Test_pebble_wa_*.log`:
-`go test -run '^Test_pebble_wa$' -count=1 -v .`
+`go test -run '^Test_pebble_wa$' -count=1 -v -timeout 30m .`
 
 测试PMT性能, 结果在`ww/Test_pmt_wa_*.log`:
-`go test -run '^Test_pmt_wa$' -count=1 -v .`
+`go test -run '^Test_pmt_wa$' -count=1 -v -timeout 30m .`
 
 如何解读结果?
 ``` 
@@ -28,13 +34,6 @@ randomread8=6565ms, kops=160, avgFilesAccessed=2.3934, hits=1436160, misses=3663
 
 测试pmt性能, 第一阶段计划方式如何修改?
 `pmtinternal.SetStep1Method(pmtinternal.PlanStep1V4) // pmtinternal.PlanStep1V4, pmtinternal.PlanStep1Simple`
-
-# 测试: 指定范围
-确保已经过生成数据, 运行`go test -run '^Test_compact_range_expansion_input_size$' -count=1 -v .`, 结果在ww/compact_range_expansion_%s.txt
-``` 
-layered-2MB	inputMB=12.00 range=[4399275004310,4401205998319] inputs=[2.00,2.00,2.00,2.00,2.00,2.00]
-```
-表示层内划分2MB, 写入量=12MB
 
 ------------------------------------
 
